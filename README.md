@@ -1,28 +1,30 @@
 # ZephyraCore
 
-ZephyraUI 生态的**核心与编译器栈**独立仓：唯一真相源，CLI 与主仓都单向依赖这里。
+ZephyraUI 生态的**库层单仓**：core、编译器栈、效果器与全部渲染后端。
+CLI 与主仓都单向依赖这里；本仓不依赖它们中的任何一个。
 
 ## 包含什么
 
-| crate | 作用 |
+| 类别 | crate |
 |---|---|
-| `zephyra-core` | 宿主无关的纯计算核心：属性系统、元素树、布局协议、DisplayList 契约 |
-| `zephyra-bezier` | 零依赖的三次贝塞尔缓动（`zephyra-core/extra/`） |
-| `zephyra-style` | 声明层：`.zstyle` 样式表 → 属性值，含动画补间 |
-| `zstyle-compile` | `.zstyle` 解析 / 校验 / 排版 |
-| `zypui` | `.zypui` 运行时 IR：解码 / 展开 / 求值 / 实例化 |
-| `zypui-compile` | `.zypui` 解析 / 校验 / 编译 |
+| 核心 | `zephyra-core`（属性系统、元素树、布局协议、DisplayList）、`zephyra-core/extra/zephyra-bezier` |
+| 声明层 / 编译器 | `zephyra-style`、`zstyle-compile`、`zypui`、`zypui-compile` |
+| 效果 / 动画 | `zephyra-fx`、`zephyra-svg-anim` |
+| 系统适配 | `zephyra-base/*`：winit、winit-d3d12、vulkan、dcomp、platform*、window、ext*、app-config、uia |
+| 可选桥接 | `zephyra-base/extra/zephyra-media`（依赖独立仓 zephyra-video） |
 
 ## 依赖方向
 
 ```
-zephyra-vector (独立仓)  →  zephyra-core  →  编译器栈
-                                  ↑               ↑
-                           ZephyraUI 主仓    ZephyraCLI
+zephyra-vector / zephyra-video (独立仓)
+                  ↓
+            ZephyraCore (本仓)
+              ↑          ↑
+        ZephyraCLI   ZephyraUI 主仓（控件层）
 ```
 
-本仓**不依赖** ZephyraUI 主仓，也不依赖任何 GPU / 窗口 / 平台库。
-宿主适配（winit / D3D / Vulkan）全部留在主仓的 `zephyra-base/*`。
+本仓唯一的外部依赖是 `zephyra-vector`（git）、`zephyra-video`（git）与
+`cssparser` / `naga` 等 crates.io 包；不含任何主仓依赖。
 
 ## 门禁
 
@@ -32,7 +34,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-## 注意
+`default-members` 只含核心与编译器（纯计算、跨平台）；后端按需 `-p` 选择，
+避免默认构建拉入 Windows COM / D3D / Vulkan 的平台依赖树。
 
-样式资产门禁（扫全仓 `.zstyle` / `.zypui`）住在**主仓**，因为资产在那里；
-本仓只测编译器逻辑本身（解析、排版、IR 不变性）。
+## 发版
+
+tag `v0.2.0` = core + 编译器 + fx + 全部后端（当前）。
+CLI 脚手架与主仓的控件层都固定到同一 tag，保证单一来源。
