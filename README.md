@@ -40,5 +40,5 @@ cargo test --workspace
 
 ## 发版
 
-tag `v0.3.0` = core + 编译器 + fx + 全部后端 + camera（当前）。
-CLI 脚手架与主仓的控件层都固定到同一 tag，保证单一来源。
+- tag `v0.2.0` = core + 编译器 + fx + 全部后端。CLI 脚手架与主仓的控件层固定于此。
+- `main` 额外含 `zephyra-camera`（可选采集 crate），未打新 tag——需要它的应用可直接依赖 `main` 或后续 tag。
