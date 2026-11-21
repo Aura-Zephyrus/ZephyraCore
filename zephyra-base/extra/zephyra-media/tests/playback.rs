@@ -53,3 +53,29 @@ fn decodes_video_and_audio_frames() {
     assert!(video_frames > 0, "no video frames decoded");
     assert!(audio_frames > 0, "no audio frames decoded");
 }
+
+#[test]
+fn player_controls_expose_volume_rate_and_position() {
+    let path = fixture_path();
+    let player = MediaPlayer::open(&path, PlayerOptions::default()).unwrap();
+
+    player.set_volume(0.4);
+    assert!((player.volume() - 0.4).abs() < 1e-6);
+    player.set_volume(2.0);
+    assert_eq!(player.volume(), 1.0);
+    player.set_muted(true);
+    assert!(player.muted());
+    player.set_muted(false);
+    assert!(!player.muted());
+
+    player.set_rate(1.5);
+    assert!((player.rate() - 1.5).abs() < 1e-6);
+
+    assert!(player.duration_us() > 0);
+    player.seek(1_000_000);
+    let position = player.position_us();
+    assert!(
+        (1_000_000..1_500_000).contains(&position),
+        "seek 后位置应在 1s 附近（含时钟推进），实际 {position}"
+    );
+}

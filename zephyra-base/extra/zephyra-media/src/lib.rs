@@ -6,6 +6,8 @@
 //! 音频输出全部按 feature 选择编译，且不进 workspace `default-members`。
 
 pub mod audio_frames;
+#[cfg(feature = "audio")]
+pub mod audio_output;
 pub mod clock;
 #[cfg(any(feature = "video", feature = "audio"))]
 pub mod decode_thread;
@@ -24,7 +26,7 @@ pub mod video_stub;
 pub use clock::PresentationClock;
 pub use error::{MediaError, Result};
 #[cfg(feature = "audio")]
-pub use output::AudioSink;
+pub use output::{bits_volume, volume_bits, AudioSink, VolumeHandle};
 #[cfg(any(feature = "video", feature = "audio"))]
 pub use pipeline::{MediaPlayer, MediaTrackInfo, PlayerOptions};
 #[cfg(feature = "video")]

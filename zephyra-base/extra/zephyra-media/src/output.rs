@@ -12,11 +12,33 @@ use cpal::{SampleFormat, Stream};
 
 use crate::error::{MediaError, Result};
 
+/// 音量以位模式存进 atomic（设备回调在音频线程里读，不能用锁）。
+pub type VolumeHandle = Arc<AtomicU32>;
+
+/// `f32` 音量 → 可原子存取的位模式。
+pub fn volume_bits(volume: f32) -> u32 {
+    u32::from_ne_bytes(volume.clamp(0.0, 1.0).to_ne_bytes())
+}
+
+/// 位模式 → `f32` 音量。
+pub fn bits_volume(bits: u32) -> f32 {
+    f32::from_ne_bytes(bits.to_ne_bytes()).clamp(0.0, 1.0)
+}
+
 /// 输出格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputSampleFormat {
     I16,
     F32,
+}
+
+impl OutputSampleFormat {
+    pub const fn bytes_per_sample(self) -> usize {
+        match self {
+            Self::I16 => 2,
+            Self::F32 => 4,
+        }
+    }
 }
 
 /// 音频设备输出。
@@ -146,7 +168,12 @@ impl AudioSink {
     }
 
     pub fn volume(&self) -> f32 {
-        f32::from_ne_bytes(self.volume.load(Ordering::Relaxed).to_ne_bytes())
+        bits_volume(self.volume.load(Ordering::Relaxed))
+    }
+
+    /// 设备回调读的那一份共享音量。宿主持有它即可在播放中改音量，不需要锁。
+    pub fn volume_handle(&self) -> VolumeHandle {
+        Arc::clone(&self.volume)
     }
 
     /// 丢弃所有未播放的数据。

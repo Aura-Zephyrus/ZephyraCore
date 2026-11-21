@@ -11,6 +11,8 @@ use std::thread::JoinHandle;
 
 use crate::clock::PresentationClock;
 use crate::error::{MediaError, Result};
+#[cfg(feature = "audio")]
+use crate::output::{bits_volume, volume_bits, AudioSink, OutputSampleFormat, VolumeHandle};
 use crate::VideoFrameSource;
 
 /// 轨道信息。
@@ -74,6 +76,18 @@ pub struct MediaPlayer {
     tracks: Vec<MediaTrackInfo>,
     #[cfg(feature = "dynamic")]
     library_report: LibraryReport,
+    // 音频输出与音量控制：全部用 atomic / 共享句柄，因此这些 API 都是 `&self`，
+    // 宿主可以把播放器放在闭包里每帧调用，不必抢一个可变借用。
+    #[cfg(feature = "audio")]
+    audio_sink: Option<AudioSink>,
+    #[cfg(feature = "audio")]
+    volume_handle: Option<VolumeHandle>,
+    #[cfg(feature = "audio")]
+    output_format: OutputSampleFormat,
+    #[cfg(feature = "audio")]
+    volume: AtomicU32,
+    #[cfg(feature = "audio")]
+    muted: AtomicBool,
 }
 
 impl MediaPlayer {
@@ -136,6 +150,36 @@ impl MediaPlayer {
             }));
         }
 
+        // 音频输出设备不需要在 open 时一定可用：拿不到就降级成「只解码不发声」，
+        // 控制 API 仍然存在（写共享音量句柄时没有接收方，安静地无操作）。
+        #[cfg(feature = "audio")]
+        let mut audio_sink = None;
+        #[cfg(feature = "audio")]
+        let mut volume_handle = None;
+        #[cfg(feature = "audio")]
+        let mut output_format = OutputSampleFormat::I16;
+        #[cfg(feature = "audio")]
+        if options.audio {
+            if let Some(track) = tracks
+                .iter()
+                .find(|t| t.sample_rate.is_some() && t.channels.is_some())
+            {
+                let sample_rate = track.sample_rate.unwrap();
+                let channels = track.channels.unwrap();
+                for fmt in [OutputSampleFormat::F32, OutputSampleFormat::I16] {
+                    match AudioSink::open(sample_rate, channels, fmt) {
+                        Ok(sink) => {
+                            volume_handle = Some(sink.volume_handle());
+                            audio_sink = Some(sink);
+                            output_format = fmt;
+                            break;
+                        }
+                        Err(e) => eprintln!("[zephyra-media] 音频设备不支持 {fmt:?}: {e}"),
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             video_rx,
             audio_rx,
@@ -148,6 +192,16 @@ impl MediaPlayer {
             tracks,
             #[cfg(feature = "dynamic")]
             library_report,
+            #[cfg(feature = "audio")]
+            audio_sink,
+            #[cfg(feature = "audio")]
+            volume_handle,
+            #[cfg(feature = "audio")]
+            output_format,
+            #[cfg(feature = "audio")]
+            volume: AtomicU32::new(volume_bits(1.0)),
+            #[cfg(feature = "audio")]
+            muted: AtomicBool::new(false),
         })
     }
 
@@ -237,6 +291,81 @@ impl MediaPlayer {
         for tx in &self.cmd_tx {
             let _ = tx.send(Command::Reset);
         }
+    }
+
+    /// 当前播放位置（微秒）。播放器控件的时间/进度条读它。
+    pub fn position_us(&self) -> i64 {
+        self.clock.lock().map(|c| c.now_us()).unwrap_or(0)
+    }
+
+    /// 容器里最长的轨道时长（微秒）；`0` = 未知。
+    pub fn duration_us(&self) -> i64 {
+        self.tracks
+            .iter()
+            .filter_map(|t| t.duration_us)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn set_rate(&self, rate: f64) {
+        if let Ok(mut c) = self.clock.lock() {
+            c.set_rate(rate);
+        }
+    }
+
+    pub fn rate(&self) -> f64 {
+        self.clock.lock().map(|c| c.rate()).unwrap_or(1.0)
+    }
+
+    /// 音量（0..1）。写共享句柄，设备回调立刻按新值缩放，不需要重建流。
+    #[cfg(feature = "audio")]
+    pub fn set_volume(&self, volume: f32) {
+        self.volume.store(volume_bits(volume), Ordering::Relaxed);
+        self.apply_volume();
+    }
+
+    #[cfg(feature = "audio")]
+    pub fn volume(&self) -> f32 {
+        bits_volume(self.volume.load(Ordering::Relaxed))
+    }
+
+    #[cfg(feature = "audio")]
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+        self.apply_volume();
+    }
+
+    #[cfg(feature = "audio")]
+    pub fn muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "audio")]
+    fn apply_volume(&self) {
+        if let Some(handle) = &self.volume_handle {
+            let effective = if self.muted() { 0.0 } else { self.volume() };
+            handle.store(volume_bits(effective), Ordering::Relaxed);
+        }
+    }
+
+    /// 把解码好的 PCM 帧送进音频设备。宿主每帧调一次。
+    #[cfg(feature = "audio")]
+    pub fn pump_audio(&self) {
+        let Some(sink) = &self.audio_sink else {
+            return;
+        };
+        while let Some(frame) = self.poll_audio_frame() {
+            let bytes = crate::audio_output::interleave(&frame, self.output_format);
+            if !bytes.is_empty() {
+                sink.write(&bytes);
+            }
+        }
+    }
+
+    /// 是否真的有音频输出设备（没有也能播画面，只是静音）。
+    #[cfg(feature = "audio")]
+    pub fn has_audio_output(&self) -> bool {
+        self.audio_sink.is_some()
     }
 }
 

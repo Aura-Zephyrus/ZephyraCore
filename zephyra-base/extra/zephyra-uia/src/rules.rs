@@ -52,6 +52,9 @@ const ROLE_BY_CLASS: &[(&str, Role)] = &[
     ("radio-group", Role::Group),
     ("switch", Role::Switch),
     ("radio-box", Role::RadioButton),
+    // 播放器根节点是容器；内部按钮靠 `.button` 映射成 Button。
+    // 进度/音量条目前不报 RangeValue —— UIA 侧没有 Slider 角色，见控件能力清单。
+    ("video-player", Role::Group),
 ];
 
 /// 开关状态的分类名 → 状态。

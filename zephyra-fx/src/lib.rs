@@ -98,16 +98,13 @@ pub fn range_has_lcd_text(
     range: &std::ops::Range<usize>,
 ) -> bool {
     use zephyra_core::paint::{Command, GlyphMask};
-    list.iter()
-        .skip(range.start)
-        .take(range.len())
-        .any(|item| {
-            matches!(
-                &item.command,
-                Command::Text { glyphs, .. }
-                    if glyphs.iter().any(|g| matches!(g.mask, GlyphMask::LcdMsdf { .. }))
-            )
-        })
+    list.iter().skip(range.start).take(range.len()).any(|item| {
+        matches!(
+            &item.command,
+            Command::Text { glyphs, .. }
+                if glyphs.iter().any(|g| matches!(g.mask, GlyphMask::LcdMsdf { .. }))
+        )
+    })
 }
 
 /// 标量属性的本地定义（宿主自定义控件用）。
