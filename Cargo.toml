@@ -7,6 +7,32 @@ members = [
     "zstyle-compile",
     "zypui",
     "zypui-compile",
+    "zephyra-fx",
+    "zephyra-svg-anim",
+    "zephyra-base/zephyra-app-config",
+    "zephyra-base/zephyra-dcomp",
+    "zephyra-base/zephyra-ext",
+    "zephyra-base/zephyra-ext-wgpu",
+    "zephyra-base/zephyra-platform",
+    "zephyra-base/zephyra-platform-linux",
+    "zephyra-base/zephyra-platform-win",
+    "zephyra-base/zephyra-render-ext",
+    "zephyra-base/zephyra-window",
+    "zephyra-base/zephyra-winit",
+    "zephyra-base/zephyra-winit-d3d12",
+    "zephyra-base/zephyra-winit-input",
+    "zephyra-base/zephyra-vulkan",
+    "zephyra-base/extra/zephyra-media",
+    "zephyra-base/extra/zephyra-uia",
+]
+# default-members 只含核心 + 编译器（纯计算，跨平台）；后端按需 -p 选择，
+# 避免默认构建拉入 Windows COM / D3D / Vulkan 的平台依赖树。
+default-members = [
+    "zephyra-core",
+    "zephyra-style",
+    "zstyle-compile",
+    "zypui",
+    "zypui-compile",
 ]
 
 [workspace.package]
