@@ -26,7 +26,7 @@ use std::rc::Rc;
 use windows::core::Interface;
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, RECT};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_FORMAT_R16_UINT};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT;
 
 use crate::quad::{self, RenderReport, Vertex};
 use crate::shader::{self, ShaderError, Shaders};
@@ -71,6 +71,7 @@ pub(crate) fn format_uses_nv12_ps(fmt: ExternalTextureFormat) -> bool {
 /// NV12 是 4:2:0 半平面：Y 平面 `w×h` 每像素 1 字节；UV 平面 `(w/2)×(h/2)`
 /// 个交错 `RG` 对，每像素 2 字节 —— 所以两个平面的 tight 行宽**恰好都是 w**。
 /// 宽高必须为偶数，否则 UV 尺寸无法整除，采样会越界且没有报错。
+#[cfg(test)] // 原生 NV12 双平面上传已让位给 RGBA 重排路径；仅布局单测仍需要
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Nv12Layout {
     pub y_width: u32,
@@ -82,6 +83,7 @@ pub(crate) struct Nv12Layout {
 }
 
 /// 计算 NV12 布局；宽高非正偶数时失败（不静默向下取整）。
+#[cfg(test)]
 pub(crate) fn nv12_layout(w: u32, h: u32) -> Result<Nv12Layout, SurfaceError> {
     if w == 0 || h == 0 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
         return Err(SurfaceError::new(
@@ -99,6 +101,7 @@ pub(crate) fn nv12_layout(w: u32, h: u32) -> Result<Nv12Layout, SurfaceError> {
 }
 
 /// 驱动 footprint + 源行距 → 两平面上传参数（纯计算，供无 GPU 单测钉住）。
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Nv12FootprintPlan {
     pub y_offset: u64,
@@ -119,6 +122,7 @@ pub(crate) struct Nv12FootprintPlan {
 ///
 /// `driver` / `src_pitches` 的顺序都是 `[0]=Y, [1]=UV`。驱动给的行距必须
 /// 装得下一行 tight 像素，否则图像会横向错位且只报调试层消息。
+#[cfg(test)]
 pub(crate) fn nv12_footprint_plan(
     layout: Nv12Layout,
     driver: [(u64, u32); 2],
@@ -2331,156 +2335,64 @@ impl Renderer {
         Ok(slot)
     }
 
-    /// 把 `CpuPlanes` 的 Y + UV 两个平面上传为一张 `DXGI_FORMAT_NV12` 纹理。
+    /// 把 NV12 的 Y + UV 平面整理成一张 RGBA8 纹理（R=Y、G=U、B=V、A=255）。
     ///
-    /// # 子资源布局
+    /// # 为什么不是原生 `DXGI_FORMAT_NV12` 资源
     ///
-    /// NV12 有 2 个子资源：`0` = Y（`w×h`，1 字节/像素），`1` = UV
-    /// (`w/2 × h/2`，2 字节/像素的 RG 对)。`GetCopyableFootprints` 一次取两个，
-    /// 两块数据按各自 `Offset` 摆进**同一块**上传堆缓冲，再用两次
-    /// `CopyTextureRegion`（`SubresourceIndex` 0 / 1）拷进默认堆纹理。
+    /// D3D12 不允许给 NV12 资源建 4 通道 SRV：用 `None` 让驱动隐式派生会报
+    /// `Views of video formats cannot be created using a NULL Desc`；显式给
+    /// `R8G8B8A8_UNORM` 又被拒（`... format name ... can't be R8G8B8A8_UNORM`）。
+    /// 两者都会直接触发设备移除 `0x887A0005`。而现有 NV12 PS 只绑一张 t0、
+    /// 按 `(Y,U,V,1)` 采样（见 `zephyra_nv12.hlsl` 的 `nv12_to_rgb`），所以这里
+    /// 把平面重排进 RGBA8：SRV 走合法的隐式派生，PS 仍按 NV12 变体解释 RGB。
+    /// 代价是每帧一次 O(w*h) 的 CPU 重排；正确性优先于这条路径的零拷贝。
     ///
-    /// # 为什么 SRV 不在本函数里建
-    ///
-    /// 与 RGBA 路径一样由 `sync_ext_texture_srvs` 用 `CreateShaderResourceView(
-    /// resource, None, …)` 建：隐式派生格式，避免手写 desc 与资源格式失 sync
-    /// （D3D11 的 NV12 经验是显式 desc 会被部分驱动以 `0x80070057` 拒绝）。
-    ///
-    /// # 原地更新
-    ///
-    /// `resource` 已存在时先发 `PIXEL_SHADER_RESOURCE → COPY_DEST` 屏障；
-    /// 首发时资源本就是 `COPY_DEST`。拷完统一转回 `PIXEL_SHADER_RESOURCE`。
-    /// staging 挂在 `res.staging` 上，由 `begin_frame` 的 `wait_gpu` 后在下一帧替换。
+    /// 上传本身复用 [`Self::stage_ext_cpu_upload`]，首发建纹理、原地更新走屏障，
+    /// staging 的生命周期与 RGBA 路径完全一致。
     fn stage_ext_nv12_upload(
         &self,
         list: &ID3D12GraphicsCommandList,
         res: &mut crate::ext::ExtResource,
         planes: &zephyra_render_ext::prelude::CpuPlanes,
     ) -> Result<(), SurfaceError> {
-        let layout = nv12_layout(res.width, res.height)?;
+        let w = res.width;
+        let h = res.height;
         let y = planes.plane(0).ok_or_else(|| {
             SurfaceError::new("NV12 上传", windows::core::Error::new(E_FAIL, "缺 Y 平面"))
         })?;
         let uv = planes.plane(1).ok_or_else(|| {
             SurfaceError::new("NV12 上传", windows::core::Error::new(E_FAIL, "缺 UV 平面"))
         })?;
-
-        let first = res.resource.is_none();
-        if first {
-            let mut desc = texture_desc((res.width, res.height), D3D12_RESOURCE_FLAG_NONE);
-            desc.Format = DXGI_FORMAT_NV12;
-            res.resource = Some(create_resource(
-                &self.device,
-                &heap_props(D3D12_HEAP_TYPE_DEFAULT),
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-            )?);
-        }
-        let texture = res.resource.as_ref().expect("just ensured");
-
-        // 与创建时同形：GetCopyableFootprints 必须拿到 NV12 格式与 2 个子资源，
-        // 否则行距按 RGBA 算，UV 平面整片错位。
-        let mut nv12_desc = texture_desc((res.width, res.height), D3D12_RESOURCE_FLAG_NONE);
-        nv12_desc.Format = DXGI_FORMAT_NV12;
-        let mut footprints = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
-        let mut total = 0u64;
-        unsafe {
-            self.device.GetCopyableFootprints(
-                &nv12_desc,
-                0,
-                2,
-                0,
-                Some(footprints.as_mut_ptr()),
-                None,
-                None,
-                Some(&mut total),
-            );
-        }
-        let plan = nv12_footprint_plan(
-            layout,
-            [
-                (footprints[0].Offset, footprints[0].Footprint.RowPitch),
-                (footprints[1].Offset, footprints[1].Footprint.RowPitch),
-            ],
-            [planes.row_pitch[0], planes.row_pitch[1]],
-        )?;
-
-        // 源平面每行的字节数不足就提前报错；直接按 src_pitch 读会越界。
-        for (name, data, pitch, rows) in [
-            ("Y", y, plan.y_src_pitch, plan.y_rows),
-            ("UV", uv, plan.uv_src_pitch, plan.uv_rows),
-        ] {
-            let need = pitch as u64 * rows as u64;
-            if (data.len() as u64) < need {
-                return Err(SurfaceError::new(
-                    "NV12 上传",
-                    windows::core::Error::new(
-                        E_FAIL,
-                        format!("{name} 平面需要 {need} 字节，实收 {}", data.len()),
-                    ),
-                ));
-            }
+        let y_pitch = planes.row_pitch[0] as usize;
+        let uv_pitch = planes.row_pitch[1] as usize;
+        if y.len() < y_pitch * h as usize || uv.len() < uv_pitch * (h as usize / 2) {
+            return Err(SurfaceError::new(
+                "NV12 上传",
+                windows::core::Error::new(E_FAIL, "平面长度不足"),
+            ));
         }
 
-        let staging = UploadBuffer::new(&self.device, total.max(plan.staging_bytes))?;
-        unsafe {
-            for row in 0..plan.y_rows as usize {
-                std::ptr::copy_nonoverlapping(
-                    y.as_ptr().add(row * plan.y_src_pitch as usize),
-                    staging
-                        .mapped
-                        .add(plan.y_offset as usize + row * plan.y_dst_pitch as usize),
-                    plan.y_row_bytes as usize,
-                );
+        // NV12 → RGBA8：每像素取同一位置的 Y 与该 2×2 色度块的 U/V。
+        // A 恒 255；PS 的 nv12_to_rgb 只吃 RGB 三个通道，alpha 由它自己置 1。
+        let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                let o = (row * w as usize + col) * 4;
+                let uo = (row / 2) * uv_pitch + (col / 2) * 2;
+                rgba[o] = y[row * y_pitch + col];
+                rgba[o + 1] = uv.get(uo).copied().unwrap_or(128);
+                rgba[o + 2] = uv.get(uo + 1).copied().unwrap_or(128);
+                rgba[o + 3] = 255;
             }
-            for row in 0..plan.uv_rows as usize {
-                std::ptr::copy_nonoverlapping(
-                    uv.as_ptr().add(row * plan.uv_src_pitch as usize),
-                    staging
-                        .mapped
-                        .add(plan.uv_offset as usize + row * plan.uv_dst_pitch as usize),
-                    plan.uv_row_bytes as usize,
-                );
-            }
-            if !first {
-                crate::surface::Gpu::barrier(
-                    list,
-                    texture,
-                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                );
-            }
-            for (sub, footprint) in footprints.iter().enumerate() {
-                list.CopyTextureRegion(
-                    &D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: std::mem::ManuallyDrop::new(Some(texture.clone())),
-                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            SubresourceIndex: sub as u32,
-                        },
-                    },
-                    0,
-                    0,
-                    0,
-                    &D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: std::mem::ManuallyDrop::new(Some(staging.resource.clone())),
-                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            PlacedFootprint: *footprint,
-                        },
-                    },
-                    None,
-                );
-            }
-            crate::surface::Gpu::barrier(
-                list,
-                texture,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            );
         }
-        res.staging = Some(staging);
-        Ok(())
+        let cpu = zephyra_ext::CpuTextureDescOwned {
+            pixels: rgba,
+            width: w,
+            height: h,
+            row_pitch: w * 4,
+            format: ExternalTextureFormat::Rgba8Unorm,
+        };
+        self.stage_ext_cpu_upload(list, res, &cpu)
     }
 
     /// 把一份 CPU 像素拷进 `res.resource`（`resource` 为空时先创建纹理）。
