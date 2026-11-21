@@ -41,7 +41,7 @@ rust-version.workspace = true
 #
 # base 层是系统适配层。整条 D3D11/DXGI/DComp 链路都是 FFI。
 #
-# 通用层（`zephyra/zephyra-core`）的 `forbid(unsafe_code)` **不动**：那条约束才是
+# 通用层（`zephyra-core`）的 `forbid(unsafe_code)` **不动**：那条约束才是
 # 「宿主迁移时不必搬核心」的前提。见 zephyra/zephyra-base/README.md。
 
 [dependencies]

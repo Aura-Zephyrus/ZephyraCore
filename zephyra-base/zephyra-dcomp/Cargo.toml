@@ -11,9 +11,9 @@ rust-version.workspace = true
 # 本仓的"可选子包"之一。放在 workspace `members` 但排除出 `default-members`，
 # 理由：无差别的 `cargo build` / `cargo test` 不该编译设备相关代码。
 #
-# 但理由更强一层 —— 本 crate 用了 `unsafe`（COM / DXGI），而 `zephyra/zephyra-core`
-# 与 `zephyra/zephyra-core-winit` 都是 `unsafe_code = "forbid"`。放进 default-members
-# 会让「无差别构建」这个动作本身开始编译 unsafe 代码。
+# 但理由更强一层 —— 本 crate 用了 `unsafe`（COM / DXGI），而 `zephyra-core`
+# 是 `unsafe_code = "forbid"`。放进 default-members 会让「无差别构建」这个动作
+# 本身开始编译 unsafe 代码。
 #
 #   cargo build                    # 不碰本 crate（零依赖核心仍然干净）
 #   cargo test  -p zephyra-dcomp    # 显式构建；纯逻辑断言在 CPU 上跑
@@ -37,11 +37,6 @@ log = "0.4"
 # 版本错配而不是任何一段代码。所以这里与宿主对齐版本，让"接得上"这件事由类型系统
 # 保证。
 [target.'cfg(windows)'.dependencies]
-# `IDCompositionVisual2::SetTransform2` 的入参类型就是 `windows_numerics::Matrix3x2`，
-# 而 `windows` 只**转发**这个类型、不重导出 —— 所以要直接依赖它才能把矩阵传进去。
-# 它是 `windows` 的同仓子 crate，本就��� `Cargo.lock` 里，不引入额外下载。
-windows-numerics = "0.3"
-
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D11",
