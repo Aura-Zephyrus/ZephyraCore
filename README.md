@@ -12,6 +12,7 @@ CLI 与主仓都单向依赖这里；本仓不依赖它们中的任何一个。
 | 效果 / 动画 | `zephyra-fx`、`zephyra-svg-anim` |
 | 系统适配 | `zephyra-base/*`：winit、winit-d3d12、vulkan、dcomp、platform*、window、ext*、app-config、uia |
 | 可选桥接 | `zephyra-base/extra/zephyra-media`（依赖独立仓 zephyra-video） |
+| 可选采集 | `zephyra-base/extra/zephyra-camera`（默认零设备依赖，`capture`/`dx` feature 按需） |
 
 ## 依赖方向
 
@@ -39,5 +40,5 @@ cargo test --workspace
 
 ## 发版
 
-tag `v0.2.0` = core + 编译器 + fx + 全部后端（当前）。
+tag `v0.3.0` = core + 编译器 + fx + 全部后端 + camera（当前）。
 CLI 脚手架与主仓的控件层都固定到同一 tag，保证单一来源。

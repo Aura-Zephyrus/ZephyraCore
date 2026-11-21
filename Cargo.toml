@@ -24,6 +24,7 @@ members = [
     "zephyra-base/zephyra-vulkan",
     "zephyra-base/extra/zephyra-media",
     "zephyra-base/extra/zephyra-uia",
+    "zephyra-base/extra/zephyra-camera",
 ]
 # default-members 只含核心 + 编译器（纯计算，跨平台）；后端按需 -p 选择，
 # 避免默认构建拉入 Windows COM / D3D / Vulkan 的平台依赖树。

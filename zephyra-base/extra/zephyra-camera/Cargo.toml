@@ -1,0 +1,45 @@
+[package]
+name = "zephyra-camera"
+description = "Camera capture and pixel-format handling for zephyra applications"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# 默认**什么都不开**：nokhwa（USB 摄像头采集）不是每个应用都需要，
+# `cargo build` / `cargo test` 不会拉任何设备代码。选择性编译：
+#   cargo build -p zephyra-camera                       # 仅像素格式（零依赖）
+#   cargo build -p zephyra-camera --features capture   # 设备采集
+#   cargo build -p zephyra-camera --all-features       # 全部
+[features]
+default = []
+capture = ["dep:nokhwa", "dep:log"]
+serde = ["dep:serde"]
+dx = ["capture", "dep:windows", "dep:windows-core"]
+
+[dependencies]
+bytes = "1"
+nokhwa = { version = "0.10", features = ["input-msmf"], optional = true }
+log = { version = "0.4", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-core = { version = "0.62", optional = true }
+windows = { version = "0.62", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_MediaFoundation",
+] }
+
+[lints.rust]
+unsafe_code = "allow"  # dx feature 含 COM/MediaFoundation FFI
