@@ -144,7 +144,7 @@ fn expand_plain(
         ctx.size,
         &|n| textures.contains(n),
         shift,
-        Some(range),
+        Some(range.clone()),
         one,
     );
     report.absorb(inner);
@@ -159,6 +159,10 @@ fn expand_plain(
             *idx += vtx_base as u16;
         }
     }
+    // LCD 字形在 fs_main 里采样 g_dst 决定覆盖率取 min 还是 max（Skia 规则）。
+    // 这类 draw 虽走固定混合，仍需要一份真实目标副本；没有它 set 1 绑的是图集
+    // 占位视图，采样出的 dst_a 是字形图集像素 ⇒ alpha 退化成 max（彩边）。
+    let has_lcd = zephyra_fx::range_has_lcd_text(list, &range);
     let draws: Vec<DrawCall> = one
         .runs()
         .iter()
@@ -175,6 +179,7 @@ fn expand_plain(
             DrawCall {
                 texture: run.texture.clone(),
                 blend: run.blend,
+                needs_dst: has_lcd,
                 index_start: idx_base + index_start,
                 index_count,
             }
@@ -312,6 +317,8 @@ struct DrawCall {
     /// 要绑的纹理名；`None` = 绑图集。
     texture: Option<Rc<str>>,
     blend: BlendMode,
+    /// 这条 draw 含 LCD 字形：需要真实 `g_dst` 副本（与 PS 变体同样走快照流程）。
+    needs_dst: bool,
     index_start: u32,
     index_count: u32,
 }
@@ -2808,6 +2815,7 @@ impl Renderer {
             uv_view: Option<vk::ImageView>,
             format: ExternalTextureFormat,
             pipeline: DrawPipeline,
+            needs_dst: bool,
             index_start: u32,
             index_count: u32,
         }
@@ -2834,6 +2842,7 @@ impl Renderer {
                 uv_view,
                 format,
                 pipeline,
+                needs_dst: d.needs_dst,
                 index_start: d.index_start,
                 index_count: d.index_count,
             });
@@ -2851,37 +2860,45 @@ impl Renderer {
                 uv_view,
                 format,
                 pipeline,
+                needs_dst,
                 index_start,
                 index_count,
             } = draw;
             let nv12 = uv_view.is_some() && uses_nv12_pipeline(format);
             let is_ps = matches!(pipeline, DrawPipeline::Ps(_));
+            // LCD 字形虽走固定混合，但 fs_main 会采样 g_dst 选 alpha 的 min/max，
+            // 所以和 PS 变体一样需要真实目标副本（否则 set 1 绑图集占位视图）。
+            let needs_snapshot = is_ps || needs_dst;
             // 目标此刻是附件 —— 必须先结束通道、拷出副本、再重开。
             // 两条通道的快照方式不同：主通道 resolve MSAA，RT 通道 copy RT 内容
             // （按屏幕坐标摆，见 `snapshot_rt` 的文档）。
-            let dst = if is_ps {
+            let dst = if needs_snapshot {
                 self.ensure_dst_rt(dev, self.size);
                 self.dst_rt.as_ref().map(|rt| (rt.image, rt.view, rt.size))
             } else {
                 None
             };
-            if is_ps {
+            if needs_snapshot {
                 unsafe {
                     self.device.cmd_end_render_pass(cmd);
                 }
                 match rt {
                     Some(rt_ctx) => self.snapshot_rt(cmd, &rt_ctx),
                     None => {
-                        let (img, _view, sz) = dst.unwrap();
-                        self.snapshot_dst(
-                            cmd,
-                            &Rt {
-                                image: img,
-                                view: vk::ImageView::null(),
-                                memory: vk::DeviceMemory::null(),
-                                size: sz,
-                            },
-                        );
+                        // dst_rt 建不出来（显存不足）⇒ 跳过快照，set 1 退化为图集
+                        // 占位视图：LCD alpha 退回 max，与 D3D12 降级语义一致，
+                        // 而不是在这里 panic 把整帧打死。
+                        if let Some((img, _view, sz)) = dst {
+                            self.snapshot_dst(
+                                cmd,
+                                &Rt {
+                                    image: img,
+                                    view: vk::ImageView::null(),
+                                    memory: vk::DeviceMemory::null(),
+                                    size: sz,
+                                },
+                            );
+                        }
                     }
                 }
                 // 按所在通道重开：主通道是 MSAA+resolve，RT 通道是单采样。

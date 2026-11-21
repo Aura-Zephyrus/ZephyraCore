@@ -1566,6 +1566,16 @@ impl Renderer {
             context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         }
 
+        // LCD 字形在 PSMain 里采样 `g_dst` 决定覆盖率取 min 还是 max（Skia 规则）。
+        // 固定混合段的 `ps_variant` 是 `None`，平时不绑 t1 —— 这里为本段里**含 LCD
+        // 字形**的情况单独取一份目标副本，绑到 t1。副本必须在任何字形画上去**之前**
+        // 取，否则采到的是字形自己（彩边）；没有 LCD 时零开销。
+        let lcd_dst = if zephyra_fx::range_has_lcd_text(list, range) {
+            self.refresh_dst_copy(device, context, env.rtv, env.size)
+        } else {
+            None
+        };
+
         // ---- 逐段回放：一段一次 draw ----
         //
         // 为什么按 [`quad::DrawRun`] 走而不是把 solid / images / paths 三段写死：
@@ -1599,7 +1609,8 @@ impl Renderer {
                     self.blends[mode]
                         .clone()
                         .unwrap_or_else(|| self.blend.clone()),
-                    None,
+                    // 固定混合段平时不读 g_dst；本段有 LCD 字形时绑目标副本。
+                    lcd_dst.clone(),
                     0u32,
                 ),
                 // PS 合成模式：需要 `dst` 的副本，绑到 **t1**（`g_dst` 的槽位）。

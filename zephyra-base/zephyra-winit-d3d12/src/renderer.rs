@@ -2988,20 +2988,7 @@ impl Renderer {
         self.bind_state(list, env, env.size, env.damage)?;
         // LCD 字形在 shader 里读 `g_dst` 决定 alpha 取 min 还是 max
         // （Skia 的规则）。这里确保副本是**此刻**的目标内容；没开 LCD 时零开销。
-        let lcd_text = display_list
-            .iter()
-            .skip(range.start)
-            .take(range.len())
-            .any(|item| {
-                matches!(
-                    &item.command,
-                    zephyra_core::paint::Command::Text { glyphs, .. }
-                        if glyphs.iter().any(|g| matches!(
-                            g.mask,
-                            zephyra_core::paint::GlyphMask::LcdMsdf { .. }
-                        ))
-                )
-            });
+        let lcd_text = zephyra_fx::range_has_lcd_text(display_list, range);
         if lcd_text {
             let _ = self.refresh_dst_copy(targets, device, list, env.rt, env.size, false, None);
         }
