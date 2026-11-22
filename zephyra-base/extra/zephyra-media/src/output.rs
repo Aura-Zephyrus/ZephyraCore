@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, Stream};
+use cpal::Stream;
 
 use crate::error::{MediaError, Result};
 
@@ -58,28 +58,17 @@ impl AudioSink {
             .default_output_device()
             .ok_or_else(|| MediaError::Platform("no default audio output device".into()))?;
 
-        let sample_format = match format {
-            OutputSampleFormat::I16 => SampleFormat::I16,
-            OutputSampleFormat::F32 => SampleFormat::F32,
-        };
+        // 不做 supported_output_configs() 预检：cpal 0.15.3 的 WASAPI 实现里
+        // 每次调用都会泄漏一小块 COM 枚举资源（实测 ~2.6KB/次，2000 次后
+        // pagefile +5MB）。而 build_output_stream 本身就会校验配置并在不支持时
+        // 返回错误 —— 调用方 MediaPlayer::open 已经做了 F32→I16→降级的尝试，
+        // 预检是多余的。去掉它既堵住泄漏，又让"设备到底支持什么"由真正的
+        // 构建调用来裁决（比枚举结果更准）。
         let config = cpal::StreamConfig {
             channels,
             sample_rate: cpal::SampleRate(sample_rate),
             buffer_size: cpal::BufferSize::Default,
         };
-        let mut supported = device
-            .supported_output_configs()
-            .map_err(|e| MediaError::Platform(format!("query output configs: {e}")))?;
-        if !supported.any(|c| {
-            c.channels() == channels
-                && c.sample_format() == sample_format
-                && c.min_sample_rate() <= cpal::SampleRate(sample_rate)
-                && c.max_sample_rate() >= cpal::SampleRate(sample_rate)
-        }) {
-            return Err(MediaError::Platform(format!(
-                "unsupported output config: {channels}ch {sample_rate}Hz {format:?}"
-            )));
-        }
 
         let bytes_per_sample = if format == OutputSampleFormat::F32 {
             4

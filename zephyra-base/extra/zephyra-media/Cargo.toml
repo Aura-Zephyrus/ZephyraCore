@@ -79,3 +79,10 @@ required-features = ["video-h264", "aac", "audio"]
 [[test]]
 name = "load_report"
 required-features = ["dynamic"]
+
+[[test]]
+name = "audio_sink_leak"
+required-features = ["audio"]
+
+[dev-dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
