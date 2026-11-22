@@ -5,14 +5,14 @@
 //! 却从未接在一起。这里第一次让它们串起来跑，并断言串起来之后的可见行为。
 
 use crate::context::Context;
-use crate::core::{Color, Rect, UvRect};
+use crate::core::{Color, Rect, Size, UvRect};
 use crate::diff::diff;
 use crate::element::Element;
 use crate::id::NodeTag;
 use crate::layout::layout;
 use crate::layout::{
-    AlignContent, AlignItems, AlignSelf, Anchor, Direction, FlexDirection, FlexWrap, MainAxisAlign,
-    Position,
+    measure, AlignContent, AlignItems, AlignSelf, Anchor, Constraints, Direction, FlexDirection,
+    FlexWrap, LayoutEnv, MainAxisAlign, Position,
 };
 use crate::node::Node;
 use crate::paint::render;
@@ -1385,5 +1385,266 @@ fn scroll_content_is_measured_unbounded_on_the_scroll_axis() {
     assert!(
         (r.height - 150.0).abs() < 1e-3,
         "内容盒应当是 150 高（不被视口压扁），实得 {r:?}"
+    );
+}
+
+// ============================== 布局边界路径（变异验证） ==============================
+
+/// `Flex::resolve_main` 的 shrink 冻结循环：多项缩到 0 后，剩余缺口必须
+/// 继续按 `shrink × basis` 重分给尚未冻结的项，而不是留在总尺寸里溢出。
+#[test]
+fn flex_shrink_freezes_at_zero_then_redistributes_the_remaining_deficit() {
+    let e = Element::new(NodeTag::Box)
+        .with(
+            &props::FLEX_DIRECTION,
+            PropertyValue::flex_direction(FlexDirection::Row),
+        )
+        .with_children([
+            sized(10.0, 10.0)(Element::new(NodeTag::Control))
+                .with(&props::FLEX_SHRINK, PropertyValue::float(10.0)),
+            sized(10.0, 10.0)(Element::new(NodeTag::Control))
+                .with(&props::FLEX_SHRINK, PropertyValue::float(10.0)),
+            sized(100.0, 10.0)(Element::new(NodeTag::Control))
+                .with(&props::FLEX_SHRINK, PropertyValue::float(1.0)),
+            sized(200.0, 10.0)(Element::new(NodeTag::Control))
+                .with(&props::FLEX_SHRINK, PropertyValue::float(2.0)),
+        ]);
+    let node = laid_out(&e, Rect::new(0.0, 0.0, 200.0, 20.0));
+    let rects = child_rects(&node);
+    assert_eq!(rects.len(), 4);
+
+    // basis 和 = 320，可用 200 ⇒ 首轮缺口 -120；权重 100:100:100:400，
+    // 前两项各缩 -120×100/700 ≈ -17.14 ⇒ 触底 0 并冻结。
+    assert_eq!(
+        (rects[0].width, rects[1].width),
+        (0.0, 0.0),
+        "先触底的两项应冻结在 0"
+    );
+    // 次轮仅剩权重 100:400 = 1:4，缺口 -100/7 按 1:4 分掉 ⇒ 80、120。
+    assert!(
+        (rects[2].width - 80.0).abs() < 1e-3,
+        "重分后第三项应为 80，实得 {}",
+        rects[2].width
+    );
+    assert!(
+        (rects[3].width - 120.0).abs() < 1e-3,
+        "重分后第四项应为 120，实得 {}",
+        rects[3].width
+    );
+    assert!(
+        (rects[3].x - 80.0).abs() < 1e-3,
+        "前三项宽 0/0/80 ⇒ 第四项起点 80"
+    );
+}
+
+/// 三行 flex（每行一项、行高 10、行距 0、容器交叉轴 100 ⇒ slack=70），
+/// 用 `AlignItems::Stretch` 让矩形高度直接等于行盒长度、y 直接等于行盒起点。
+fn multi_line_rects(align: AlignContent) -> Vec<Rect> {
+    let e = Element::new(NodeTag::Box)
+        .with(
+            &props::FLEX_DIRECTION,
+            PropertyValue::flex_direction(FlexDirection::Row),
+        )
+        .with(&props::FLEX_WRAP, PropertyValue::flex_wrap(FlexWrap::Wrap))
+        .with(&props::ALIGN_CONTENT, PropertyValue::align_content(align))
+        .with(
+            &props::CROSS_ALIGN,
+            PropertyValue::cross_align(AlignItems::Stretch),
+        )
+        .with(&props::SPACING, PropertyValue::float(0.0))
+        .with_children([
+            sized(100.0, 10.0)(Element::new(NodeTag::Control)),
+            sized(100.0, 10.0)(Element::new(NodeTag::Control)),
+            sized(100.0, 10.0)(Element::new(NodeTag::Control)),
+        ]);
+    child_rects(&laid_out(&e, Rect::new(0.0, 0.0, 100.0, 100.0)))
+}
+
+/// `Flex::line_boxes` 的 `AlignContent` 全枚举：逐行断言起点与行长的精确值。
+#[test]
+fn align_content_distributes_multi_line_boxes() {
+    // Start: 起点 0，行距 0 ⇒ 每行紧挨：0/10/20。
+    let r = multi_line_rects(AlignContent::Start);
+    assert_eq!(
+        r.iter().map(|x| (x.y, x.height)).collect::<Vec<_>>(),
+        vec![(0.0, 10.0), (10.0, 10.0), (20.0, 10.0)]
+    );
+
+    // Center: 整组起点 70/2 = 35。
+    let r = multi_line_rects(AlignContent::Center);
+    assert_eq!(
+        r.iter().map(|x| x.y).collect::<Vec<_>>(),
+        vec![35.0, 45.0, 55.0]
+    );
+
+    // End: 整组贴交叉轴末端，起点 = slack = 70。
+    let r = multi_line_rects(AlignContent::End);
+    assert_eq!(
+        r.iter().map(|x| x.y).collect::<Vec<_>>(),
+        vec![70.0, 80.0, 90.0]
+    );
+
+    // SpaceBetween: 额外空隙 70/(3-1) = 35 全进行距 ⇒ 0/45/90。
+    let r = multi_line_rects(AlignContent::SpaceBetween);
+    assert_eq!(
+        r.iter().map(|x| x.y).collect::<Vec<_>>(),
+        vec![0.0, 45.0, 90.0]
+    );
+
+    // SpaceAround: 空隙 70/3 ≈ 23.3333，端部半宽 ≈ 11.6667 ⇒ 11.6667/45/78.3333。
+    let r = multi_line_rects(AlignContent::SpaceAround);
+    let ys: Vec<f32> = r.iter().map(|x| x.y).collect();
+    assert!((ys[0] - 11.6667).abs() < 1e-3, "实得 {}", ys[0]);
+    assert!((ys[1] - 45.0).abs() < 1e-3, "实得 {}", ys[1]);
+    assert!((ys[2] - 78.3333).abs() < 1e-3, "实得 {}", ys[2]);
+
+    // SpaceEvenly: 空隙 70/(3+1) = 17.5，端部同宽 ⇒ 17.5/45/72.5。
+    let r = multi_line_rects(AlignContent::SpaceEvenly);
+    assert_eq!(
+        r.iter().map(|x| x.y).collect::<Vec<_>>(),
+        vec![17.5, 45.0, 72.5]
+    );
+
+    // Stretch: 不挪位置，把 slack 均摊进行长 ⇒ 每行 10 + 70/3 ≈ 33.3333。
+    let r = multi_line_rects(AlignContent::Stretch);
+    let boxes: Vec<(f32, f32)> = r.iter().map(|x| (x.y, x.height)).collect();
+    assert!((boxes[0].0 - 0.0).abs() < 1e-3 && (boxes[0].1 - 33.3333).abs() < 1e-3);
+    assert!((boxes[1].0 - 33.3333).abs() < 1e-3 && (boxes[1].1 - 33.3333).abs() < 1e-3);
+    assert!((boxes[2].0 - 66.6667).abs() < 1e-3 && (boxes[2].1 - 33.3333).abs() < 1e-3);
+}
+
+/// `WrapReverse` 只镜像行盒的交叉轴位置，不翻转行内项的先后。
+#[test]
+fn wrap_reverse_mirrors_line_positions_but_keeps_items_within_a_line() {
+    let e = Element::new(NodeTag::Box)
+        .with(
+            &props::FLEX_DIRECTION,
+            PropertyValue::flex_direction(FlexDirection::Row),
+        )
+        .with(
+            &props::FLEX_WRAP,
+            PropertyValue::flex_wrap(FlexWrap::WrapReverse),
+        )
+        .with(
+            &props::ALIGN_CONTENT,
+            PropertyValue::align_content(AlignContent::Start),
+        )
+        .with(&props::SPACING, PropertyValue::float(10.0))
+        .with_children([
+            sized(40.0, 10.0)(Element::new(NodeTag::Control)),
+            sized(40.0, 10.0)(Element::new(NodeTag::Control)),
+            sized(40.0, 10.0)(Element::new(NodeTag::Control)),
+        ]);
+    let node = laid_out(&e, Rect::new(0.0, 0.0, 100.0, 60.0));
+    let rects = child_rects(&node);
+
+    // 两行：行0=[0,1]（40+10+40=90），行1=[2]。
+    // Start 下行盒 y=0 与 20；镜像公式 60 - start - extent ⇒ 行0→50、行1→30。
+    assert_eq!((rects[0].x, rects[0].y), (0.0, 50.0));
+    assert_eq!((rects[1].x, rects[1].y), (50.0, 50.0));
+    assert_eq!((rects[2].x, rects[2].y), (0.0, 30.0));
+}
+
+/// `Stack::main_offset_rules` 的 `n == 1` 特例：三种 Space 对齐都不留空隙。
+#[test]
+fn a_single_child_under_space_alignments_stays_at_the_main_start() {
+    for align in [
+        MainAxisAlign::SpaceBetween,
+        MainAxisAlign::SpaceAround,
+        MainAxisAlign::SpaceEvenly,
+    ] {
+        let e = Element::new(NodeTag::Box)
+            .with(
+                &props::DIRECTION,
+                PropertyValue::direction(Direction::Horizontal),
+            )
+            .with(&props::MAIN_ALIGN, PropertyValue::main_align(align))
+            .with(&props::SPACING, PropertyValue::float(8.0))
+            .with_children([sized(40.0, 10.0)(Element::new(NodeTag::Control))]);
+        let r = child_rects(&laid_out(&e, Rect::new(0.0, 0.0, 200.0, 20.0)))[0];
+        assert_eq!(
+            (r.x, r.width),
+            (0.0, 40.0),
+            "{align:?} 单项不应留空隙（漏掉特例会落到 x=80），实得 {r:?}"
+        );
+    }
+}
+
+/// `finite`：负的显式尺寸按「未设置」处理，回落到测量出的内容尺寸。
+#[test]
+fn negative_explicit_sizes_fall_back_to_the_measured_content_size() {
+    let e = Element::new(NodeTag::Box)
+        .with(&props::WIDTH, PropertyValue::float(-10.0))
+        .with(&props::HEIGHT, PropertyValue::float(-5.0))
+        .with_children([sized(55.0, 23.0)(Element::new(NodeTag::Control))]);
+    let node = as_child(e, Rect::new(0.0, 0.0, 500.0, 500.0));
+    assert_eq!(
+        node.rect(),
+        Rect::new(0.0, 0.0, 55.0, 23.0),
+        "负数宽高应视为未设置并回落到内容 55×23（误当 Some(-10/-5) 会得到 0×0）"
+    );
+}
+
+/// `pick_axis` 第一步夹逼：下限优先于显式尺寸。
+#[test]
+fn pick_axis_clamps_to_the_lower_bound() {
+    let mut node = Node::from_element(&sized(10.0, 5.0)(Element::new(NodeTag::Box)));
+    let size = measure(
+        &mut node,
+        Constraints {
+            min: Size::new(80.0, 0.0),
+            max: Size::new(200.0, 100.0),
+        },
+        &LayoutEnv::new(Size::new(200.0, 100.0)),
+        ctx(),
+    );
+    assert_eq!(
+        (size.width, size.height),
+        (80.0, 5.0),
+        "explicit=10 < min=80 ⇒ 下限胜出"
+    );
+}
+
+/// `pick_axis` 第二步夹逼：显式尺寸与内容尺寸都不能越过上限。
+#[test]
+fn pick_axis_clamps_explicit_and_content_sizes_to_the_upper_bound() {
+    let constraints = Constraints {
+        min: Size::new(0.0, 0.0),
+        max: Size::new(200.0, 100.0),
+    };
+    let env = LayoutEnv::new(Size::new(200.0, 100.0));
+
+    let mut explicit = Node::from_element(&sized(500.0, 5.0)(Element::new(NodeTag::Box)));
+    let s1 = measure(&mut explicit, constraints, &env, ctx());
+    assert_eq!((s1.width, s1.height), (200.0, 5.0), "显式 500 应被压到 200");
+
+    let e = Element::new(NodeTag::Box)
+        .with(
+            &props::DIRECTION,
+            PropertyValue::direction(Direction::Horizontal),
+        )
+        .with_children([sized(500.0, 5.0)(Element::new(NodeTag::Control))]);
+    let mut content = Node::from_element(&e);
+    let s2 = measure(&mut content, constraints, &env, ctx());
+    assert_eq!((s2.width, s2.height), (200.0, 5.0), "内容 500 应被压到 200");
+}
+
+/// `pick_axis` 的交叉验证：无显式尺寸时内容尺寸叠加内边距；上限无界时跳过夹逼。
+#[test]
+fn pick_axis_adds_padding_to_content_and_keeps_it_when_max_is_unbounded() {
+    let e = Element::new(NodeTag::Box)
+        .with(&props::PADDING, PropertyValue::float(7.0))
+        .with_children([sized(20.0, 6.0)(Element::new(NodeTag::Control))]);
+    let mut node = Node::from_element(&e);
+    let size = measure(
+        &mut node,
+        Constraints::unbounded(),
+        &LayoutEnv::unbounded(),
+        ctx(),
+    );
+    assert_eq!(
+        (size.width, size.height),
+        (34.0, 20.0),
+        "内容 20×6 + 四边内边距 7 ⇒ 34×20"
     );
 }

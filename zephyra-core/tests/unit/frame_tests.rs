@@ -14,13 +14,18 @@
 //!
 //! 第 3 条最要紧：脏区算小了的后果是**残影**，而残影在真机上极难归因到脏区。
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use crate::context::Context;
-use crate::core::Color;
+use crate::core::{Color, Rect};
 use crate::element::Element;
-use crate::frame::{Damage, FrameCache, FrameOutcome};
+use crate::frame::{Damage, FrameCache, FrameOutcome, StageTimings};
 use crate::id::NodeTag;
+use crate::node::Node;
 use crate::property::PropertyValue;
 use crate::props;
+use crate::styler::Styler;
 use crate::theme::Theme;
 
 /// 走完 声明 → 缓存帧，返回本帧结果与列表长度。
@@ -559,4 +564,215 @@ fn unchanged_produces_no_damage() {
         FrameOutcome::Unchanged => {}
         FrameOutcome::Updated { .. } => panic!("稳态不该是 Updated"),
     }
+}
+
+// ==================================================================
+// 4. StageTimings::sum_us
+// ==================================================================
+
+/// 全零时和为 0。
+#[test]
+fn stage_timings_sum_is_zero_for_default() {
+    assert_eq!(StageTimings::default().sum_us(), 0);
+}
+
+/// 五个阶段逐项相加，且**不含** `total_us`。
+///
+/// 变异点：漏加某一字段、把 `total_us` 也算进去、把 `+` 写成 `max`。
+#[test]
+fn stage_timings_sum_adds_five_stages_excluding_total() {
+    let t = StageTimings {
+        diff_us: 1,
+        style_us: 2,
+        scan_us: 3,
+        layout_us: 4,
+        paint_us: 5,
+        total_us: 999,
+    };
+    assert_eq!(t.sum_us(), 15);
+}
+
+/// 大数但**不溢出**时仍精确求和（本实现是朴素 `u32 +`，debug 下溢出会 panic，
+/// 因此这里按实际实现取一个接近但低于 `u32::MAX` 的字面量）。
+#[test]
+fn stage_timings_sum_handles_large_values_without_overflow() {
+    let t = StageTimings {
+        diff_us: 400_000_000,
+        style_us: 400_000_000,
+        scan_us: 400_000_000,
+        layout_us: 400_000_000,
+        paint_us: 400_000_000,
+        total_us: u32::MAX,
+    };
+    assert_eq!(t.sum_us(), 2_000_000_000);
+}
+
+// ==================================================================
+// 5. Damage: Display / is_full
+// ==================================================================
+
+/// `Display` 的短形式必须可用于调试桥的一行统计。`Rect` 用 `{:.0}` 取整。
+///
+/// 变异点：`Full` 写成 `Debug` 形式、括号/分隔符写错、漏掉 `x` 前缀。
+#[test]
+fn damage_display_uses_short_forms() {
+    assert_eq!(Damage::Full.to_string(), "Full");
+    assert_eq!(
+        Damage::Rect(Rect::new(12.0, 34.0, 56.0, 78.0)).to_string(),
+        "Rect(12,34,56x78)"
+    );
+    assert_eq!(
+        Damage::Rect(Rect::new(0.0, 0.0, 0.0, 0.0)).to_string(),
+        "Rect(0,0,0x0)"
+    );
+}
+
+/// `is_full()` 只对 `Full` 为真；`Rect` 一律为假。
+#[test]
+fn damage_is_full_only_for_full_variant() {
+    assert!(Damage::Full.is_full());
+    assert!(!Damage::Rect(Rect::new(0.0, 0.0, 10.0, 10.0)).is_full());
+}
+
+// ==================================================================
+// 6. FrameOutcome / timings —— 可观察时机
+// ==================================================================
+
+/// 首帧之前没有任何计时数据。
+#[test]
+fn timings_before_first_frame_are_default() {
+    let cache = FrameCache::new();
+    assert_eq!(cache.timings(), StageTimings::default());
+}
+
+/// 稳态帧（`Unchanged`）只跑 diff / 样式 / 扫描三段：`layout_us` 与 `paint_us`
+/// 必须是 0。若有人把早退删掉或改用别的判据，这两段就会被赋值。
+#[test]
+fn steady_frame_timings_leave_layout_and_paint_at_zero() {
+    let mut cache = FrameCache::new();
+    let el = two_nodes();
+    step(&mut cache, &el, (400.0, 300.0)); // 首帧：会跑布局 + 绘制
+
+    let (changed, _) = step(&mut cache, &el, (400.0, 300.0));
+    assert!(!changed, "前置：第二帧应 Unchanged");
+    let t = cache.timings();
+    assert_eq!(t.layout_us, 0, "稳态帧没跑布局");
+    assert_eq!(t.paint_us, 0, "稳态帧没跑绘制");
+}
+
+// ==================================================================
+// 7. set_styler / set_post_diff 注入时机
+// ==================================================================
+
+/// 计数样式器：每次 apply 给根节点写同一个背景色（幂等）。
+struct CountingStyler(Rc<Cell<usize>>);
+
+impl Styler for CountingStyler {
+    fn apply(&mut self, root: &mut Node) {
+        self.0.set(self.0.get() + 1);
+        root.set_styled_prop(
+            &crate::props::BACKGROUND,
+            PropertyValue::color(Color::rgb(0.3, 0.4, 0.5)),
+        );
+    }
+}
+
+/// 样式器每帧都跑（diff 之后、布局之前），写出的背景色会进 DisplayList；同值
+/// 重复写不标脏，于是第二帧仍是 `Unchanged`。
+#[test]
+fn styler_runs_every_frame_before_paint_and_is_idempotent() {
+    let calls = Rc::new(Cell::new(0));
+    let mut cache = FrameCache::new();
+    cache.set_styler(Box::new(CountingStyler(calls.clone())));
+
+    // 没有背景色的裸盒子 —— 唯一的颜色来自 styler。
+    let el = Element::new(NodeTag::Box)
+        .with(&props::WIDTH, PropertyValue::float(40.0))
+        .with(&props::HEIGHT, PropertyValue::float(20.0));
+    let (changed, len) = step(&mut cache, &el, (400.0, 300.0));
+    assert!(changed);
+    assert!(len >= 1, "styler 写了背景色，必须产出至少一条 Quad");
+    assert_eq!(calls.get(), 1, "第一帧应调用一次 styler");
+
+    let (changed, _) = step(&mut cache, &el, (400.0, 300.0));
+    assert!(!changed, "styler 写同值不该让稳态失效");
+    assert_eq!(calls.get(), 2, "styler 每帧都跑，包括 Unchanged 帧");
+}
+
+/// `set_styler` 自带 invalidate：在稳态之后安装样式器必须让下一帧重绘。
+#[test]
+fn setting_styler_invalidates_steady_frame() {
+    let mut cache = FrameCache::new();
+    let el = two_nodes();
+    step(&mut cache, &el, (400.0, 300.0));
+    let (changed, _) = step(&mut cache, &el, (400.0, 300.0));
+    assert!(!changed, "前置：稳态应 Unchanged");
+
+    cache.set_styler(Box::new(CountingStyler(Rc::new(Cell::new(0)))));
+    let (changed, _) = step(&mut cache, &el, (400.0, 300.0));
+    assert!(changed, "set_styler 必须 invalidate，否则新样式永远不生效");
+}
+
+/// 后处理钩子同一样每帧都跑，且在布局之前写入 paint 属性。
+#[test]
+fn post_diff_hook_runs_every_frame_before_paint() {
+    let calls = Rc::new(Cell::new(0));
+    let c = calls.clone();
+    let mut cache = FrameCache::new();
+    cache.set_post_diff(Box::new(move |node: &mut Node| {
+        c.set(c.get() + 1);
+        node.set_styled_prop(
+            &props::BACKGROUND,
+            PropertyValue::color(Color::rgb(0.7, 0.1, 0.8)),
+        );
+    }));
+
+    let el = Element::new(NodeTag::Box)
+        .with(&props::WIDTH, PropertyValue::float(40.0))
+        .with(&props::HEIGHT, PropertyValue::float(20.0));
+    let (changed, len) = step(&mut cache, &el, (400.0, 300.0));
+    assert!(changed);
+    assert!(len >= 1, "钩子写了背景色，必须产出至少一条 Quad");
+    assert_eq!(calls.get(), 1);
+
+    let (changed, _) = step(&mut cache, &el, (400.0, 300.0));
+    assert!(!changed, "钩子写同值不该让稳态失效");
+    assert_eq!(calls.get(), 2, "钩子每帧都跑");
+}
+
+/// `set_post_diff` 也自带 invalidate。
+#[test]
+fn setting_post_diff_invalidates_steady_frame() {
+    let mut cache = FrameCache::new();
+    let el = two_nodes();
+    step(&mut cache, &el, (400.0, 300.0));
+    let (changed, _) = step(&mut cache, &el, (400.0, 300.0));
+    assert!(!changed, "前置：稳态应 Unchanged");
+
+    cache.set_post_diff(Box::new(|_node: &mut Node| {}));
+    let (changed, _) = step(&mut cache, &el, (400.0, 300.0));
+    assert!(
+        changed,
+        "set_post_diff 必须 invalidate，否则动画钩子装上后第一帧不生效"
+    );
+}
+
+// ==================================================================
+// 8. debug_paint_oracle（debug only）
+// ==================================================================
+
+/// 开启 oracle 不应改变列表内容，也不应 invalidate（稳态帧仍是 `Unchanged`）。
+#[cfg(debug_assertions)]
+#[test]
+fn debug_paint_oracle_does_not_disturb_frames() {
+    let mut cache = FrameCache::new();
+    let el = two_nodes();
+
+    cache.set_debug_paint_oracle(true);
+    let (changed, len) = step(&mut cache, &el, (400.0, 300.0));
+    assert!(changed, "首帧仍应 Updated");
+    assert!(len >= 2, "oracle 分支不能吞掉/清空绘制列表");
+
+    let (changed, _) = step(&mut cache, &el, (400.0, 300.0));
+    assert!(!changed, "开启 oracle 不应强制重绘");
 }

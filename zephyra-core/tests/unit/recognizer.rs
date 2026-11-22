@@ -115,3 +115,39 @@ fn pinch_fends_when_finger_disappears() {
     let g = r2.on_pointer(ev(1, 100.0, 100.0, PointerPhase::Move));
     assert!(!g.is_pinching, "活跃指针不足应结束捏合");
 }
+
+/// 两指落在同一点 ⇒ `initial_distance = prev_distance = 0`。这是除零退化路径：
+/// 若 `prev_distance == 0` 的早退被改掉/反转，后续 `dist / prev_distance` 会算出
+/// inf 或 NaN。判据：激活锚点缩放恒为 1.0，且后续移动绝不产出捏合增量。
+#[test]
+fn zero_distance_pinch_stays_finite_with_unit_anchor_scale() {
+    let mut r = Recognizer::new();
+    r.on_pointer(ev(1, 100.0, 100.0, PointerPhase::Down));
+    let g = r.on_pointer(ev(2, 100.0, 100.0, PointerPhase::Down));
+
+    assert!(g.pinch_started, "同点双指仍应激活捏合");
+    let anchor = g.pinch.expect("激活必须携带锚点增量");
+    assert_eq!(anchor.scale, 1.0, "零距离激活的锚点缩放必须是 1.0");
+    assert!(anchor.scale.is_finite());
+    assert_eq!(anchor.center_x, 100.0, "中点应是无 NaN 的字面值");
+    assert_eq!(anchor.center_y, 100.0);
+
+    // 两指拉开：prev_distance 仍为 0，早退必须拦住所有增量（含 NaN/inf）。
+    for (id, x, y) in [
+        (1u64, 130.0f32, 100.0f32),
+        (2, 160.0, 100.0),
+        (1, 200.0, 100.0),
+    ] {
+        let g = r.on_pointer(ev(id, x, y, PointerPhase::Move));
+        assert!(
+            g.pinch.is_none(),
+            "prev_distance==0 时不得产出增量（实得 {:?}）",
+            g.pinch
+        );
+        if let Some(d) = g.pinch {
+            assert!(d.scale.is_finite(), "缩放不得为 NaN/inf");
+            assert_eq!(d.scale, 1.0, "无参考距离时缩放保持 1.0");
+        }
+    }
+    assert!(r.is_pinching(), "早退不应结束捏合状态");
+}

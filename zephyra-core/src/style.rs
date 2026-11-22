@@ -662,3 +662,7 @@ fn sanitized_scale(v: f32) -> f32 {
         1.0
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/style_value_tests.rs"]
+mod style_value_tests;

@@ -119,3 +119,7 @@ pub fn dark_context() -> Context<'static> {
 pub fn light_context() -> Context<'static> {
     Context::new(LIGHT_THEME.get_or_init(crate::theme::Theme::light))
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/context_id_tests.rs"]
+mod context_id_tests;

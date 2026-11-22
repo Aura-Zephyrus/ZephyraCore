@@ -15,6 +15,7 @@ fn every_named_key_roundtrips_from_canonical_name() {
         Key::Delete,
         Key::Enter,
         Key::Escape,
+        Key::Space,
         Key::Tab,
         Key::Left,
         Key::Right,
@@ -44,6 +45,7 @@ fn as_str_names_all_in_reverse_table() {
         Key::Delete,
         Key::Enter,
         Key::Escape,
+        Key::Space,
         Key::Tab,
         Key::Left,
         Key::Right,
@@ -73,6 +75,18 @@ fn keypad_enter_and_other_keypad_names_map_to_enter() {
     assert_eq!(Key::Enter.as_str(), "Enter");
 }
 
+/// Space 是控件激活键（与 Enter 等价），却是键名表里最容易漏的一项：
+/// `as_str` 漏了它 ⇒ 快捷键名变成 "Other"；`from_name` 漏了它 ⇒ "Space" 反查落进
+/// `Other`，按钮收不到空格激活。两个方向都用字面量钉住。
+#[test]
+fn space_roundtrips_in_both_name_table_directions() {
+    assert_eq!(Key::Space.as_str(), "Space");
+    assert_eq!(Key::from_name("Space"), Key::Space);
+    assert_eq!(Key::from_name(Key::Space.as_str()), Key::Space);
+    assert_eq!(KeyInput::press(Key::Space).name, "Space");
+    assert_eq!(Key::Space.to_string(), "Space");
+}
+
 #[test]
 fn unknown_names_fall_into_other_not_panic() {
     assert_eq!(Key::from_name("F5"), Key::Other);
@@ -84,7 +98,7 @@ fn unknown_names_fall_into_other_not_panic() {
 
 #[test]
 fn shortcut_identity_lives_in_name_not_enum() {
-    // `Key::Other` 的 `as_str()` 是 "Other" —— 它只说明「不在这 13 个里」。
+    // `Key::Other` 的 `as_str()` 是 "Other" —— 它只说明「不在这 14 个里」。
     // 真正的身份（"F5"）在 `KeyInput::name`，由宿主填写。
     let f5 = KeyInput {
         key: Key::Other,

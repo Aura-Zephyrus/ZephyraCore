@@ -604,3 +604,7 @@ pub fn clear_dirty(node: &mut Node) {
         clear_dirty(child);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/node_prop_tests.rs"]
+mod node_prop_tests;

@@ -180,3 +180,156 @@ fn owned_and_borrowed_lists_have_same_shape() {
     assert_eq!(p.first().unwrap().as_str(), "zh-CN");
     assert_eq!(p, Preferences::from_list(&["zh-CN"]));
 }
+
+/// `with_weight` / `Weighted`：权重是 `Accept-Language` 的 `q` 值，必须原样写入，
+/// 且**不参与重排**（有序偏好表的顺序即优先级）。
+#[test]
+fn weighted_preferences_keep_weight_and_order() {
+    let prefs = Preferences::from_list(&["en-US", "zh-CN", "ja"]);
+    let weighted = prefs.with_weight(0.9);
+    // 权重字段确实被写入（写死成 1.0 / 忽略入参都会红）。
+    assert_eq!(weighted.weight, 0.9);
+    assert_ne!(prefs.with_weight(0.5).weight, weighted.weight);
+    // 偏好表原样克隆，顺序不变。
+    assert_eq!(weighted.prefs, prefs);
+    let order: Vec<String> = weighted.prefs.tags().iter().map(|t| t.as_str()).collect();
+    assert_eq!(order, vec!["en-US", "zh-CN", "ja"]);
+}
+
+/// `remove` / `len_for` / `is_empty`：`remove` 是"制造漏翻"的门禁专用刀，
+/// 必须真的删掉目标键、返回是否删成功，且不误伤其他 locale。
+#[test]
+fn messages_remove_len_for_and_is_empty() {
+    let mut m = Messages::new();
+    assert!(m.is_empty());
+    m.insert("en", "a", "A");
+    m.insert("en", "b", "B");
+    m.insert("ja", "a", "あ");
+    assert!(!m.is_empty());
+    assert_eq!(m.len_for("en"), 2);
+    assert_eq!(m.len_for("ja"), 1);
+    assert_eq!(m.len_for("fr"), 0);
+
+    // 删存在的键返回 true，且只影响该 locale。
+    assert!(m.remove("en", "a"));
+    assert!(m.remove("en", "b"));
+    assert_eq!(m.len_for("en"), 0);
+    assert_eq!(m.len_for("ja"), 1);
+    assert!(m.get("en", "a").is_none());
+    assert_eq!(m.get("ja", "a"), Some("あ"));
+
+    // 删不存在的键返回 false，计数不变。
+    assert!(!m.remove("en", "a"));
+    assert!(!m.remove("fr", "x"));
+    assert_eq!(m.len_for("ja"), 1);
+
+    // 删光最后一条后 is_empty 归真。
+    assert!(m.remove("ja", "a"));
+    assert!(m.is_empty());
+    assert_eq!(m.len_for("ja"), 0);
+}
+
+/// `negotiate` 距离相等时的 tie-break：可用表里两个 locale 与偏好距离相同，
+/// 代码用 `d < bd`（严格小于）⇒ 相等时不替换，取 **available 中靠前**的那个。
+/// 若比较符改成 `d <= bd`，靠后的会胜出，下面每条断言都会红。
+#[test]
+fn negotiate_tie_break_prefers_earlier_available_locale() {
+    // want 只有 language 段，与 zh-Hans / zh-Hant 的距离同为 3（丢 script 与 region）。
+    let prefs = Preferences::from_list(&["zh"]);
+    let available = [
+        Tag::parse("zh-Hans").unwrap(),
+        Tag::parse("zh-Hant").unwrap(),
+    ];
+    assert_eq!(negotiate(&prefs, &available).unwrap().as_str(), "zh-Hans");
+
+    // 交换 available 顺序 ⇒ 靠前的变成 zh-Hant，仍应取靠前者。
+    let available_rev = [
+        Tag::parse("zh-Hant").unwrap(),
+        Tag::parse("zh-Hans").unwrap(),
+    ];
+    assert_eq!(
+        negotiate(&prefs, &available_rev).unwrap().as_str(),
+        "zh-Hant"
+    );
+
+    // 另一档距离（丢 region = 2）的 tie 同样取靠前：zh-Hans-CN 而非 zh-Hans-TW。
+    let prefs2 = Preferences::from_list(&["zh-Hans"]);
+    let a2 = [
+        Tag::parse("zh-Hans-CN").unwrap(),
+        Tag::parse("zh-Hans-TW").unwrap(),
+    ];
+    assert_eq!(negotiate(&prefs2, &a2).unwrap().as_str(), "zh-Hans-CN");
+}
+
+/// `Tag::parse` 的拒绝分支：重复 script/region、非法长度（1 字母 language、
+/// 5 字母子标签、3 字母非数字 region、3/5 字母 script）都必须 None。
+#[test]
+fn tag_parse_rejects_duplicate_and_illegal_subtags() {
+    // 重复 script：第二个 4 字母子标签无处安放 ⇒ None。
+    assert!(Tag::parse("zh-Hans-Latn").is_none());
+    // 重复 region：两个 2 字母子标签 ⇒ None。
+    assert!(Tag::parse("zh-CN-US").is_none());
+    // 数字 region 与字母 region 混用也算重复。
+    assert!(Tag::parse("zh-419-US").is_none());
+    assert!(Tag::parse("zh-US-419").is_none());
+    // 非法长度：1 字母 language、5 字母子标签无对应分支 ⇒ None。
+    assert!(Tag::parse("e-US").is_none());
+    assert!(Tag::parse("zh-USABC").is_none());
+    // region 只认 2 字母或 3 数字；3 字母非数字不是 region ⇒ None。
+    assert!(Tag::parse("zh-USA").is_none());
+    // script 长度非法（3 / 5 字母）⇒ None。
+    assert!(Tag::parse("zh-Han").is_none());
+    assert!(Tag::parse("zh-Hansi").is_none());
+}
+
+/// `Tag::parse` 的正确解析：4 字母 script + 2 字母 / 3 数字 region，
+/// 且大小写规范化由 `title_case` / `to_ascii_uppercase` 完成。
+#[test]
+fn tag_parse_accepts_four_letter_script_and_two_or_three_letter_region() {
+    let t = Tag::parse("en-latn-gb").unwrap();
+    assert_eq!(t.language(), "en");
+    assert_eq!(t.script(), Some("Latn"));
+    assert_eq!(t.region(), Some("GB"));
+    assert_eq!(t.as_str(), "en-Latn-GB");
+
+    // 3 数字地区（UN M.49）与 script 同时出现。
+    let t = Tag::parse("zh-hans-419").unwrap();
+    assert_eq!(t.script(), Some("Hans"));
+    assert_eq!(t.region(), Some("419"));
+    assert_eq!(t.as_str(), "zh-Hans-419");
+}
+
+/// `Display` 必须输出规范化字符串（与 `as_str` 一致）。
+#[test]
+fn tag_display_matches_normalized_string() {
+    let t = Tag::parse("zh-hans-cn").unwrap();
+    assert_eq!(format!("{}", t), "zh-Hans-CN");
+    assert_eq!(format!("{}", t), t.as_str());
+    assert_eq!(format!("{}", Tag::parse("en").unwrap()), "en");
+    assert_eq!(
+        format!("{}", Tag::parse("zh-hant-TW").unwrap()),
+        "zh-Hant-TW"
+    );
+}
+
+/// `valid_language` / `valid_script` / `valid_region` / `title_case` 的边界值。
+/// 这些私有函数经 `Tag::parse` 间接测试：把边界改动成别的值就会红。
+#[test]
+fn tag_validation_boundaries_and_title_case() {
+    // valid_language: 长度 2..=8 且全 ASCII 字母。
+    assert!(Tag::parse("aa").is_some());
+    assert!(Tag::parse("abcdefgh").is_some());
+    assert!(Tag::parse("a").is_none()); // 长度 1：下界之外
+    assert!(Tag::parse("abcdefghi").is_none()); // 长度 9：上界之外
+    assert!(Tag::parse("ab1").is_none()); // 含非字母
+
+    // valid_script: 恰好 4 字母；title_case 首字母大写、其余小写。
+    assert_eq!(Tag::parse("zh-hANS").unwrap().script(), Some("Hans"));
+    assert_eq!(Tag::parse("zh-HANS").unwrap().script(), Some("Hans"));
+    assert!(Tag::parse("zh-han1").is_none()); // 非全字母
+
+    // valid_region: 恰好 2 字母并转大写。
+    assert_eq!(Tag::parse("zh-us").unwrap().region(), Some("US"));
+    assert!(Tag::parse("zh-u").is_none()); // 长度 1
+    assert!(Tag::parse("zh-u1").is_none()); // 含非字母
+}

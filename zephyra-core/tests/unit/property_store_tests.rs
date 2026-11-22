@@ -3,6 +3,18 @@
 
 use super::*;
 
+use std::any::Any;
+use std::sync::Arc;
+
+use crate::core::{Color, CornerShape, Rect, UvRect};
+use crate::decoration::Decorations;
+use crate::filter::{BlendMode, FilterChain, Material, MaterialParams};
+use crate::layout::{
+    AlignContent, AlignItems, AlignSelf, Anchor, Direction, FlexDirection, FlexWrap, MainAxisAlign,
+    Overflow, Position,
+};
+use crate::paint::Layer;
+
 // ⚠ `static` 而不是 `const`：`&CONST` 每次引用都**创建一个临时值**，
 // 于是 `resolve(&store, &A, None)` 返回的借用指向临时 —— 编译期就报
 // "temporary value dropped while borrowed"。`static` 才给出 `'static` 引用。
@@ -121,4 +133,347 @@ fn write_by_id_matches_write_by_key() {
         "只持 id 无法反推键，所以写不进去——返回 false 好过写一条分类靠猜的条目"
     );
     assert_eq!(by_id.iter_local().count(), 0, "写不进去就不该留下条目");
+}
+
+// ============================== PropertyValue::PartialEq / Debug / get ==============================
+
+// 两个**不同**的函数指针：实现刻意写成语义等价（都是 i32 相等判断），
+// 只有地址不同 —— 于是「同类型 + 同值」但 fn ptr 不同时，唯一能把它们分开的
+// 就是 `std::ptr::eq(*eq, *eqi)` 那一行。
+fn eq_i32(a: &dyn Any, b: &dyn Any) -> bool {
+    a.downcast_ref::<i32>() == b.downcast_ref::<i32>()
+}
+
+fn eq_i32_other(a: &dyn Any, b: &dyn Any) -> bool {
+    b.downcast_ref::<i32>() == a.downcast_ref::<i32>()
+}
+
+/// `Custom` 的相等性必须先看 **eq 函数指针**：同类型同值但两个不同的 eq 函数 ⇒ 不等。
+#[test]
+fn custom_eq_requires_the_same_eq_function_pointer() {
+    let a = PropertyValue::Custom {
+        inner: Arc::new(5i32),
+        eq: eq_i32,
+    };
+    let b = PropertyValue::Custom {
+        inner: Arc::new(5i32),
+        eq: eq_i32_other,
+    };
+    assert!(a != b, "同类型同值但 eq 指针不同必须判不等");
+    assert!(a == a.clone(), "同值且 eq 指针相同才判等");
+}
+
+/// 回归：`Custom` 的 type_id 必须取自 `Arc` 里的 trait object（内部具体类型），
+/// 而不是 `Arc<dyn Any + Send + Sync>` 这个包装类型本身——后者是 `'static` 具体类型，
+/// type_id 恒相同。修复前两个不同类型但共用同一 eq 函数的值会判等。
+#[test]
+fn custom_eq_rejects_different_inner_types_even_with_same_eq_pointer() {
+    fn eq_always(_a: &dyn std::any::Any, _b: &dyn std::any::Any) -> bool {
+        true
+    }
+    let a = PropertyValue::Custom {
+        inner: Arc::new(5i32),
+        eq: eq_always,
+    };
+    let b = PropertyValue::Custom {
+        inner: Arc::new(5i64),
+        eq: eq_always,
+    };
+    assert!(
+        a != b,
+        "内部具体类型不同必须判不等，即使 eq 函数指针相同且 eq 恒返回 true"
+    );
+}
+
+/// `Custom` 的相等性必须**真的调用**携带的 eq 函数，而不是只比指针/类型。
+#[test]
+fn custom_eq_calls_the_carried_eq_function() {
+    let a = PropertyValue::Custom {
+        inner: Arc::new(5i32),
+        eq: eq_i32,
+    };
+    let different = PropertyValue::Custom {
+        inner: Arc::new(6i32),
+        eq: eq_i32,
+    };
+    assert!(a != different, "同类型同 eq 指针但值不同 ⇒ 不等");
+    assert!(
+        a == PropertyValue::Custom {
+            inner: Arc::new(5i32),
+            eq: eq_i32,
+        },
+        "同类型同 eq 指针且值相同 ⇒ 等"
+    );
+}
+
+/// 每个变体的 `Debug` 输出都是钉死的契约：属性 diff 失败时全靠它定位。
+#[test]
+fn debug_output_pins_scalar_string_and_enum_variants() {
+    assert_eq!(format!("{:?}", PropertyValue::float(1.5)), "1.5");
+    assert_eq!(format!("{:?}", PropertyValue::int(42)), "42");
+    assert_eq!(format!("{:?}", PropertyValue::bool(true)), "true");
+    assert_eq!(
+        format!("{:?}", PropertyValue::Str(Arc::from("hi"))),
+        "\"hi\""
+    );
+    assert_eq!(format!("{:?}", PropertyValue::static_str("hey")), "\"hey\"");
+    assert_eq!(
+        format!("{:?}", PropertyValue::color(Color::rgb(1.0, 0.0, 0.0))),
+        "Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::direction(Direction::Vertical)),
+        "Vertical"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::cross_align(AlignItems::Center)),
+        "Center"
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            PropertyValue::main_align(MainAxisAlign::SpaceBetween)
+        ),
+        "SpaceBetween"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::align_content(AlignContent::Stretch)),
+        "Stretch"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::align_self(AlignSelf::Auto)),
+        "Auto"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::flex_wrap(FlexWrap::WrapReverse)),
+        "WrapReverse"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::flex_direction(FlexDirection::Column)),
+        "Column"
+    );
+    assert_eq!(format!("{:?}", PropertyValue::layer(Layer::Popup)), "Popup");
+    assert_eq!(
+        format!("{:?}", PropertyValue::position(Position::Root)),
+        "Root"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::overflow(Overflow::Hidden)),
+        "Hidden"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::anchor(Anchor::BottomRight)),
+        "BottomRight"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::blend_mode(BlendMode::Plus)),
+        "Plus"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::material(Material::Frosted)),
+        "Frosted"
+    );
+}
+
+/// 复合变体的 `Debug` 输出：滤镜报项数、装饰报哪几件在场、矩形取整、资源带名字。
+#[test]
+fn debug_output_pins_composite_variants() {
+    assert_eq!(
+        format!("{:?}", PropertyValue::filter(FilterChain::none())),
+        "Filter(0 项)"
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            PropertyValue::material_params(MaterialParams::none())
+        ),
+        "MaterialParams { amount: None, bezel: None, dispersion: None, ior: None }"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::decorations(Decorations::none())),
+        "Decorations(highlight=false shadow=false inner=false)"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::decorations(Decorations::glass())),
+        "Decorations(highlight=true shadow=true inner=true)"
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            PropertyValue::uv_rect(UvRect::new(0.0, 0.0, 1.0, 1.0))
+        ),
+        "UvRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::corner_shape(CornerShape::ROUND)),
+        "CornerShape(k=1)"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::rect(Rect::new(1.0, 2.0, 30.0, 40.0))),
+        "Rect(1,2,30x40)"
+    );
+    assert_eq!(
+        format!("{:?}", PropertyValue::Resource(Arc::from("Brush.Accent"))),
+        "Resource(Brush.Accent)"
+    );
+    assert_eq!(format!("{:?}", PropertyValue::custom(5i32)), "Custom");
+}
+
+/// `get::<T>()` 对每个变体都要向下转型成**具体**类型并返回克隆值。
+#[test]
+fn get_downcasts_every_variant_to_its_concrete_type() {
+    assert_eq!(PropertyValue::float(1.5).get::<f32>(), Some(1.5));
+    assert_eq!(PropertyValue::int(7).get::<i32>(), Some(7));
+    assert_eq!(PropertyValue::bool(true).get::<bool>(), Some(true));
+    assert_eq!(
+        PropertyValue::Str(Arc::from("hello"))
+            .get::<Arc<str>>()
+            .as_deref(),
+        Some("hello")
+    );
+    assert_eq!(
+        PropertyValue::static_str("hi").get::<&'static str>(),
+        Some("hi")
+    );
+    let red = Color::rgb(1.0, 0.0, 0.0);
+    assert_eq!(PropertyValue::color(red).get::<Color>(), Some(red));
+    assert_eq!(
+        PropertyValue::direction(Direction::Horizontal).get::<Direction>(),
+        Some(Direction::Horizontal)
+    );
+    assert_eq!(
+        PropertyValue::cross_align(AlignItems::End).get::<AlignItems>(),
+        Some(AlignItems::End)
+    );
+    assert_eq!(
+        PropertyValue::main_align(MainAxisAlign::Center).get::<MainAxisAlign>(),
+        Some(MainAxisAlign::Center)
+    );
+    assert_eq!(
+        PropertyValue::align_content(AlignContent::End).get::<AlignContent>(),
+        Some(AlignContent::End)
+    );
+    assert_eq!(
+        PropertyValue::align_self(AlignSelf::Stretch).get::<AlignSelf>(),
+        Some(AlignSelf::Stretch)
+    );
+    assert_eq!(
+        PropertyValue::flex_wrap(FlexWrap::Wrap).get::<FlexWrap>(),
+        Some(FlexWrap::Wrap)
+    );
+    assert_eq!(
+        PropertyValue::flex_direction(FlexDirection::Row).get::<FlexDirection>(),
+        Some(FlexDirection::Row)
+    );
+    assert_eq!(
+        PropertyValue::layer(Layer::Overlay).get::<Layer>(),
+        Some(Layer::Overlay)
+    );
+    assert_eq!(
+        PropertyValue::position(Position::Parent).get::<Position>(),
+        Some(Position::Parent)
+    );
+    assert_eq!(
+        PropertyValue::overflow(Overflow::Auto).get::<Overflow>(),
+        Some(Overflow::Auto)
+    );
+    assert_eq!(
+        PropertyValue::anchor(Anchor::TopLeft).get::<Anchor>(),
+        Some(Anchor::TopLeft)
+    );
+    assert_eq!(
+        PropertyValue::filter(FilterChain::none()).get::<FilterChain>(),
+        Some(FilterChain::none())
+    );
+    assert_eq!(
+        PropertyValue::blend_mode(BlendMode::SrcOver).get::<BlendMode>(),
+        Some(BlendMode::SrcOver)
+    );
+    assert_eq!(
+        PropertyValue::material(Material::Solid).get::<Material>(),
+        Some(Material::Solid)
+    );
+    assert_eq!(
+        PropertyValue::material_params(MaterialParams::none()).get::<MaterialParams>(),
+        Some(MaterialParams::none())
+    );
+    assert_eq!(
+        PropertyValue::decorations(Decorations::none()).get::<Decorations>(),
+        Some(Decorations::none())
+    );
+    assert_eq!(
+        PropertyValue::uv_rect(UvRect::FULL).get::<UvRect>(),
+        Some(UvRect::FULL)
+    );
+    assert_eq!(
+        PropertyValue::corner_shape(CornerShape::SQUIRCLE).get::<CornerShape>(),
+        Some(CornerShape::SQUIRCLE)
+    );
+    let r = Rect::new(1.0, 2.0, 3.0, 4.0);
+    assert_eq!(PropertyValue::rect(r).get::<Rect>(), Some(r));
+    assert_eq!(PropertyValue::custom(9i32).get::<i32>(), Some(9));
+}
+
+/// `get` 的两种 `None`：类型不符，以及资源键（尚未解析的中间态）。
+#[test]
+fn get_returns_none_for_wrong_type_and_for_resource_keys() {
+    assert_eq!(PropertyValue::float(1.5).get::<i32>(), None);
+    assert_eq!(PropertyValue::int(7).get::<f32>(), None);
+    assert_eq!(PropertyValue::custom(9i32).get::<u32>(), None);
+    assert_eq!(
+        PropertyValue::Resource(Arc::from("Brush.Accent")).get::<Arc<str>>(),
+        None,
+        "资源键不是已解析的值，任何 T 都取不到"
+    );
+}
+
+/// `name_affects_layout` 是 B0 时期的名字名单：只认精确名字，不再有 `Layout.` 前缀捷径。
+#[test]
+fn name_affects_layout_accepts_only_exact_listed_names() {
+    for name in [
+        "Padding",
+        "Text.LineHeight",
+        "Width",
+        "Height",
+        "Spacing",
+        "Collapsed",
+        "Direction",
+        "CrossAlign",
+        "MainAlign",
+        "Text.Size",
+        "Text.MaxWidth",
+        "Text.LetterSpacing",
+        "Text.Path",
+        "FlexGrow",
+        "FlexBasis",
+        "Order",
+        "Position",
+        "Left",
+        "Top",
+        "Anchor",
+    ] {
+        assert!(name_affects_layout(name), "{name} 必须在名单里");
+    }
+}
+
+#[test]
+fn name_affects_layout_rejects_lookalikes_and_old_prefix() {
+    for name in [
+        "Layout.Width",
+        "Layout.Spacing",
+        "Layout.Padding",
+        "padding",
+        "WIDTH",
+        "WidthX",
+        "Text.SizeX",
+        "Text.LineHeightExtra",
+        "Opacity",
+        "Background",
+        "",
+    ] {
+        assert!(
+            !name_affects_layout(name),
+            "{name} 不在名单里，不能影响布局分类"
+        );
+    }
 }

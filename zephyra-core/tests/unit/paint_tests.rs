@@ -13,13 +13,14 @@
 //! 四边形数、顶点数、内容像素全对（见 `icon_command` 的文档）。
 
 use crate::context::Context;
-use crate::core::{Color, Rect};
+use crate::core::{Color, Point, Rect};
 use crate::element::Element;
 use crate::id::NodeTag;
-use crate::layout::layout;
+use crate::layout::{layout, Position};
 use crate::node::Node;
 use crate::paint::{render, Command, DisplayList};
 use crate::property::PropertyValue;
+use crate::text::{StrutStyle, TextDecoration, TextShadow, TextStyle};
 use crate::theme::Theme;
 
 /// 走完 声明 → 布局 → 降级，挂上**内置**图标集。
@@ -735,5 +736,432 @@ fn scrolled_children_are_painted_at_the_offset_position() {
             .iter()
             .any(|r| (r.y - 50.0).abs() < 0.01 && (r.height - 50.0).abs() < 0.01),
         "第二项应当画在 50..100，实得 {quads:?}"
+    );
+}
+
+// ============================ viewBox 守卫（0 / 负） ============================
+//
+// `icon_command` 在拿到 viewBox 的 `(vx, vy, vw, vh)` 后立刻有
+// `if vw <= 0.0 || vh <= 0.0 { return None; }`。守卫反转或删除时，退化 viewBox
+// 会走进映射：`scale = (rect.width / vw).min(...)` 出现 inf/NaN，产出无效顶点，
+// 或者画出一块无意义的几何。这里每条退化输入都单独断言"不产出任何命令"。
+
+// 路径必须是有面积的三角形：`triangulate` 会丢掉零面积轮廓，而我们要保证
+// 退化 viewBox 之外的一切都是正常的（否则"不产出命令"就没有分辨力）。
+const ZERO_W_SVG: &str = r#"<svg viewBox="0 0 0 24"><path d="M 2 2 L 18 2 L 10 16 Z"/></svg>"#;
+const ZERO_H_SVG: &str = r#"<svg viewBox="0 0 24 0"><path d="M 2 2 L 18 2 L 10 16 Z"/></svg>"#;
+const NEG_W_SVG: &str = r#"<svg viewBox="0 0 -4 24"><path d="M 2 2 L 18 2 L 10 16 Z"/></svg>"#;
+const NEG_H_SVG: &str = r#"<svg viewBox="0 0 24 -4"><path d="M 2 2 L 18 2 L 10 16 Z"/></svg>"#;
+/// 对照组：正常 viewBox，证明替身图标集本身是接通的。
+const VALID_SVG: &str = r#"<svg viewBox="0 0 24 24"><path d="M 2 2 L 18 2 L 10 16 Z"/></svg>"#;
+
+const DEGENERATE_CASES: [&str; 5] = [ZERO_W_SVG, ZERO_H_SVG, NEG_W_SVG, NEG_H_SVG, VALID_SVG];
+
+/// 每条用例独占一个 `OnceLock`：图标集里的几何缓存是可变共享状态，共用会让
+/// 单跑绿、全量跑红（见 `paint_transform_tests::private_icons` 的同款理由）。
+fn degenerate_icons(slot: usize) -> &'static crate::icon::IconSet {
+    static SETS: [std::sync::OnceLock<&'static crate::icon::IconSet>; 5] = [
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+    ];
+    assert!(slot < DEGENERATE_CASES.len());
+    SETS[slot].get_or_init(|| {
+        Box::leak(Box::new(crate::icon::IconSet::new().with(
+            "degenerate",
+            crate::icon::IconSource::Svg(DEGENERATE_CASES[slot]),
+        )))
+    })
+}
+
+fn render_with_icons(
+    element: &Element,
+    bounds: Rect,
+    icons: &'static crate::icon::IconSet,
+) -> DisplayList {
+    let theme = Theme::dark();
+    let ctx = Context::new(&theme).with_icons(icons);
+    let mut node = Node::from_element(element);
+    layout(&mut node, bounds, ctx);
+    let mut list = DisplayList::new();
+    render(&node, ctx, &mut list);
+    list
+}
+
+fn has_non_finite_path_vertex(list: &DisplayList) -> bool {
+    list.iter().any(|item| match &item.command {
+        Command::Path { vertices, .. } => vertices
+            .iter()
+            .any(|v| !v.position.x.is_finite() || !v.position.y.is_finite()),
+        _ => false,
+    })
+}
+
+#[test]
+fn zero_or_negative_view_box_degrades_to_no_command() {
+    for slot in 0..4 {
+        let list = render_with_icons(&icon_el("degenerate"), UNIT, degenerate_icons(slot));
+        assert_eq!(
+            path_triangles(&list),
+            0,
+            "退化 viewBox[{}] 不该产出任何三角形 —— 守卫 `vw<=0||vh<=0` 失效",
+            slot
+        );
+        assert!(
+            list.is_empty(),
+            "退化 viewBox[{}] 应当整条命令都不产出（静默降级），实得 {} 条",
+            slot,
+            list.len()
+        );
+        assert!(
+            !has_non_finite_path_vertex(&list),
+            "退化 viewBox[{}] 不该留下 NaN/inf 顶点",
+            slot
+        );
+    }
+
+    // 对照：同一套替身、同样的路径数据，正常 viewBox 必须真的出几何。
+    let ok = render_with_icons(&icon_el("degenerate"), UNIT, degenerate_icons(4));
+    assert!(
+        path_triangles(&ok) > 0,
+        "对照组（正常 viewBox）必须产出几何，否则上面的'全都不产出'没有分辨力"
+    );
+    assert_eq!(
+        degenerate_icons(4).get("degenerate").view_box,
+        (0.0, 0.0, 24.0, 24.0),
+        "对照图标的 viewBox 应当就是 24×24"
+    );
+}
+
+// ============================ 指纹字段门禁（嵌套子字段） ============================
+//
+// src/paint.rs 末尾的 `fingerprint_tests` 覆盖了 TextStyle 的顶层字段，但若干
+// "结构体内部的子字段"只被整体设了一次，漏比较单个子字段的变异不会被抓到。
+// `text_style_fingerprint` 是 `pub(crate)`，而本文件是 `#[cfg(test)]` 下挂进
+// 同一个 crate 的单元模块，可以直接断言，无需改 src。
+
+fn push_fp_case(
+    cases: &mut Vec<(&'static str, u64, TextStyle)>,
+    name: &'static str,
+    base: &TextStyle,
+    change: impl FnOnce(&mut TextStyle),
+) {
+    let mut style = base.clone();
+    change(&mut style);
+    cases.push((name, crate::paint::text_style_fingerprint(base), style));
+}
+
+#[test]
+fn fingerprint_tracks_nested_subfields_missed_by_the_inline_test() {
+    let base = TextStyle::default();
+    let mut cases: Vec<(&'static str, u64, TextStyle)> = Vec::new();
+
+    // strut 的四个子字段：内联测试一次性全设，单点漏比较不会被发现。
+    push_fp_case(&mut cases, "strut.ascent", &base, |s| {
+        s.strut = Some(StrutStyle {
+            ascent: Some(9.0),
+            ..Default::default()
+        })
+    });
+    push_fp_case(&mut cases, "strut.descent", &base, |s| {
+        s.strut = Some(StrutStyle {
+            descent: Some(4.0),
+            ..Default::default()
+        })
+    });
+    push_fp_case(&mut cases, "strut.leading", &base, |s| {
+        s.strut = Some(StrutStyle {
+            leading: Some(2.0),
+            ..Default::default()
+        })
+    });
+    push_fp_case(&mut cases, "strut.force", &base, |s| {
+        s.strut = Some(StrutStyle {
+            force: true,
+            ..Default::default()
+        })
+    });
+
+    // shadow 的七个叶子：内联测试只断言 Some vs None。
+    push_fp_case(&mut cases, "shadow.color.r", &base, |s| {
+        s.shadow = Some(TextShadow {
+            color: Color::rgba(0.9, 0.0, 0.0, 0.5),
+            ..Default::default()
+        })
+    });
+    push_fp_case(&mut cases, "shadow.color.g", &base, |s| {
+        s.shadow = Some(TextShadow {
+            color: Color::rgba(0.0, 0.9, 0.0, 0.5),
+            ..Default::default()
+        })
+    });
+    push_fp_case(&mut cases, "shadow.color.b", &base, |s| {
+        s.shadow = Some(TextShadow {
+            color: Color::rgba(0.0, 0.0, 0.9, 0.5),
+            ..Default::default()
+        })
+    });
+    push_fp_case(&mut cases, "shadow.color.a", &base, |s| {
+        s.shadow = Some(TextShadow {
+            color: Color::rgba(0.0, 0.0, 0.0, 0.9),
+            ..Default::default()
+        })
+    });
+    push_fp_case(&mut cases, "shadow.offset.x", &base, |s| {
+        s.shadow = Some(TextShadow {
+            offset: Point::new(9.0, 1.0),
+            ..Default::default()
+        })
+    });
+    push_fp_case(&mut cases, "shadow.offset.y", &base, |s| {
+        s.shadow = Some(TextShadow {
+            offset: Point::new(1.0, 9.0),
+            ..Default::default()
+        })
+    });
+    push_fp_case(&mut cases, "shadow.blur_sigma", &base, |s| {
+        s.shadow = Some(TextShadow {
+            blur_sigma: 3.0,
+            ..Default::default()
+        })
+    });
+
+    // decoration 的另两条线：内联测试只设了 underline。
+    push_fp_case(&mut cases, "decoration.strikethrough", &base, |s| {
+        s.decoration = TextDecoration {
+            strikethrough: true,
+            ..Default::default()
+        }
+    });
+    push_fp_case(&mut cases, "decoration.overline", &base, |s| {
+        s.decoration = TextDecoration {
+            overline: true,
+            ..Default::default()
+        }
+    });
+
+    // variations：内联测试只从"空 → 一项"变化，漏比较 tag/value 的变异抓不到。
+    let mut one_variation = base.clone();
+    one_variation.variations = vec![(*b"wght", 400.0)];
+    push_fp_case(&mut cases, "variations.tag", &one_variation, |s| {
+        s.variations = vec![(*b"wdth", 400.0)]
+    });
+    push_fp_case(&mut cases, "variations.value", &one_variation, |s| {
+        s.variations = vec![(*b"wght", 700.0)]
+    });
+    push_fp_case(&mut cases, "variations.len", &one_variation, |s| {
+        s.variations = vec![(*b"wght", 400.0), (*b"wdth", 100.0)]
+    });
+
+    // lcd / path：内联测试只覆盖了"无 → 有"，这里钉"有 → 另一个值"。
+    let mut with_lcd = base.clone();
+    with_lcd.lcd = Some(crate::text::LcdOrder::Rgb);
+    push_fp_case(&mut cases, "lcd.order", &with_lcd, |s| {
+        s.lcd = Some(crate::text::LcdOrder::Bgr)
+    });
+    let mut with_path = base.clone();
+    with_path.path = Some(crate::text::TextPath::Arc { radius: 100.0 });
+    push_fp_case(&mut cases, "path.radius", &with_path, |s| {
+        s.path = Some(crate::text::TextPath::Arc { radius: 200.0 })
+    });
+
+    for (name, base_fp, style) in cases {
+        assert_ne!(
+            base_fp,
+            crate::paint::text_style_fingerprint(&style),
+            "{name} 未进入指纹"
+        );
+    }
+}
+
+// ============================ NodeDraw::scalar 取 min 轴 ============================
+
+fn all_quad_radii(list: &DisplayList) -> Vec<f32> {
+    list.iter()
+        .filter_map(|i| match &i.command {
+            Command::Quad { radius, .. } => Some(radius.radius),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn scalar_takes_the_smaller_axis_for_corner_radius() {
+    for (sx, sy) in [(4.0, 1.0), (1.0, 4.0), (4.0, 4.0)] {
+        let el = Element::new(NodeTag::Box)
+            .with(
+                &crate::props::BACKGROUND,
+                PropertyValue::color(Color::rgb(1.0, 1.0, 1.0)),
+            )
+            .with(&crate::props::CORNER_RADIUS, PropertyValue::float(10.0))
+            .with(&crate::props::SCALE_X, PropertyValue::float(sx))
+            .with(&crate::props::SCALE_Y, PropertyValue::float(sy));
+        let expected = 10.0 * sx.min(sy);
+        assert_eq!(
+            all_quad_radii(&render_of(&el, UNIT)),
+            vec![expected],
+            "scale=({sx},{sy}) 时圆角应取 min 轴 = {expected}；\
+             取 x / 取 y / 取 max 的变异都会在这里变红"
+        );
+    }
+}
+
+#[test]
+fn scalar_takes_the_smaller_axis_for_stroke_and_image_size() {
+    // 描边宽度：同样过 draw.scalar。
+    let stroke = Element::new(NodeTag::Box)
+        .with(
+            &crate::props::BORDER_COLOR,
+            PropertyValue::color(Color::rgb(0.0, 1.0, 0.0)),
+        )
+        .with(&crate::props::BORDER_WIDTH, PropertyValue::float(2.0))
+        .with(&crate::props::SCALE_X, PropertyValue::float(4.0))
+        .with(&crate::props::SCALE_Y, PropertyValue::float(1.0));
+    let widths: Vec<f32> = render_of(&stroke, UNIT)
+        .iter()
+        .filter_map(|i| match &i.command {
+            Command::Quad {
+                stroke: Some((_, w)),
+                ..
+            } => Some(*w),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(widths, vec![2.0], "scale=(4,1) 时描边宽度应为 2×min(4,1)=2");
+
+    // 图像边长：也过 draw.scalar（非等比时宁可小，不要拉伸变形）。
+    let image = Element::new(NodeTag::Box)
+        .with(
+            &crate::props::IMAGE_TEXTURE,
+            PropertyValue::static_str("some-texture"),
+        )
+        .with(&crate::props::IMAGE_SIZE, PropertyValue::float(10.0))
+        .with(&crate::props::SCALE_X, PropertyValue::float(4.0))
+        .with(&crate::props::SCALE_Y, PropertyValue::float(1.0));
+    let sizes: Vec<f32> = render_of(&image, UNIT)
+        .iter()
+        .filter_map(|i| match &i.command {
+            Command::Image { dst, .. } => Some(dst.width),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sizes,
+        vec![10.0],
+        "scale=(4,1) 时图像边长应为 10×min(4,1)=10"
+    );
+}
+
+// ============================ descend：scroll / root-position ============================
+
+#[test]
+fn scroll_offset_moves_children_but_not_the_container_box() {
+    let item = Element::new(NodeTag::Box)
+        .with_key("item")
+        .with(&crate::props::WIDTH, PropertyValue::float(100.0))
+        .with(&crate::props::HEIGHT, PropertyValue::float(50.0))
+        .with(
+            &crate::props::BACKGROUND,
+            PropertyValue::color(Color::rgb(1.0, 0.0, 0.0)),
+        );
+    let scroll = Element::new(NodeTag::Box)
+        .with_key("root")
+        .with_children([Element::new(NodeTag::Box)
+            .with_key("scroll")
+            .with(&crate::props::WIDTH, PropertyValue::float(100.0))
+            .with(&crate::props::HEIGHT, PropertyValue::float(100.0))
+            .with(
+                &crate::props::OVERFLOW,
+                PropertyValue::overflow(crate::layout::Overflow::Scroll),
+            )
+            .with(&crate::props::SCROLL_OFFSET_Y, PropertyValue::float(50.0))
+            .with(
+                &crate::props::BACKGROUND,
+                PropertyValue::color(Color::rgb(0.0, 0.0, 1.0)),
+            )
+            .with_children([item])]);
+
+    let quads: Vec<(Color, Rect)> = render_of(&scroll, SCROLL_BOUNDS)
+        .iter()
+        .filter_map(|i| match &i.command {
+            Command::Quad { rect, fill, .. } => Some((*fill, *rect)),
+            _ => None,
+        })
+        .collect();
+
+    let container = quads
+        .iter()
+        .find(|(c, _)| c.b > 0.99 && c.r < 0.01)
+        .map(|(_, r)| *r)
+        .expect("滚动容器自身应有蓝色背景 Quad");
+    assert_eq!(
+        container,
+        Rect::new(0.0, 0.0, 100.0, 100.0),
+        "滚动容器自己的盒子必须留在视口原位；若跟着 -scroll_offset 跑，\
+         用户看到的是'容器在动'而不是'内容在动'"
+    );
+
+    let child = quads
+        .iter()
+        .find(|(c, _)| c.r > 0.99 && c.g < 0.01)
+        .map(|(_, r)| *r)
+        .expect("子项应有红色背景 Quad");
+    assert_eq!(
+        child,
+        Rect::new(0.0, -50.0, 100.0, 50.0),
+        "子内容按 -scroll_offset 平移；符号反了或不平移都会在这里变红"
+    );
+}
+
+/// root 定位的子节点清掉祖先累计 translate，但保留自己的 translate。
+#[test]
+fn root_position_clears_ancestor_translate_but_keeps_own() {
+    let tree = |own_tx: f32| {
+        let child = Element::new(NodeTag::Box)
+            .with_key("child")
+            .with(
+                &crate::props::POSITION,
+                PropertyValue::position(Position::Root),
+            )
+            .with(&crate::props::LEFT, PropertyValue::float(10.0))
+            .with(&crate::props::TOP, PropertyValue::float(20.0))
+            .with(&crate::props::WIDTH, PropertyValue::float(30.0))
+            .with(&crate::props::HEIGHT, PropertyValue::float(40.0))
+            .with(&crate::props::TRANSLATE_X, PropertyValue::float(own_tx))
+            .with(
+                &crate::props::BACKGROUND,
+                PropertyValue::color(Color::rgb(1.0, 0.0, 0.0)),
+            );
+        let carrier = Element::new(NodeTag::Box)
+            .with_key("carrier")
+            .with(&crate::props::TRANSLATE_X, PropertyValue::float(60.0))
+            .with_children([child]);
+        Element::new(NodeTag::Box)
+            .with_key("root")
+            .with_children([carrier])
+    };
+
+    let red_rect = |own_tx: f32| {
+        render_of(&tree(own_tx), SCROLL_BOUNDS)
+            .iter()
+            .find_map(|i| match &i.command {
+                Command::Quad { rect, fill, .. } if fill.r > 0.99 && fill.g < 0.01 => Some(*rect),
+                _ => None,
+            })
+            .expect("应当有红色子节点的 Quad")
+    };
+
+    assert_eq!(
+        red_rect(0.0),
+        Rect::new(10.0, 20.0, 30.0, 40.0),
+        "position:root 的子节点不应继承祖先的 translate_x=60；\
+         若未清 translate，x 会是 70"
+    );
+    assert_eq!(
+        red_rect(5.0),
+        Rect::new(15.0, 20.0, 30.0, 40.0),
+        "清的是祖先累计值，不是把子节点 translate 也一起清掉"
     );
 }

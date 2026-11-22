@@ -41,3 +41,46 @@ fn nth_is_slot_ordered_and_deterministic() {
     assert_eq!(t.nth(1).map(|(id, ..)| id), Some(3));
     assert!(t.nth(2).is_none());
 }
+
+/// 第 9 个**新** ID 在满表时必须被忽略：既不能占用槽位，也不能把 count 加到 9
+/// （count 是 u8，越界写更会破坏后续 len() 语义）。
+#[test]
+fn ninth_distinct_down_is_ignored_when_table_is_full() {
+    let mut t = PointerTable::new();
+    for id in 0..MAX_POINTERS as u64 {
+        t.down(id, id as f32, 0.0);
+    }
+    assert_eq!(t.len(), MAX_POINTERS);
+
+    t.down(99, 99.0, 99.0);
+    assert_eq!(t.len(), MAX_POINTERS, "表满时新指针必须被忽略");
+    assert_eq!(t.position_of(99), None, "第 9 个 down 不得占用槽位");
+    for id in 0..MAX_POINTERS as u64 {
+        assert_eq!(
+            t.position_of(id),
+            Some((id as f32, 0.0)),
+            "已有槽位不得被挤掉"
+        );
+    }
+    assert!(t.nth(MAX_POINTERS).is_none());
+}
+
+/// 即使表满，重复 ID 的 down 也必须走「先查同 ID」的原位覆盖路径，不能被当成
+/// 新指针忽略掉（缺 Up 的重复 Down 是真实存在的外设行为）。
+#[test]
+fn duplicate_down_when_full_overwrites_in_place() {
+    let mut t = PointerTable::new();
+    for id in 0..MAX_POINTERS as u64 {
+        t.down(id, id as f32, 0.0);
+    }
+    t.down(3, 300.0, 300.0);
+
+    assert_eq!(t.len(), MAX_POINTERS, "覆盖不得改变活跃数量");
+    assert_eq!(
+        t.position_of(3),
+        Some((300.0, 300.0)),
+        "重复 ID 必须原位覆盖"
+    );
+    assert_eq!(t.nth(3), Some((3, 300.0, 300.0)), "槽位顺序不得变动");
+    assert_eq!(t.position_of(0), Some((0.0, 0.0)));
+}

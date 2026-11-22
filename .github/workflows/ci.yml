@@ -36,3 +36,32 @@ jobs:
 
       - name: test
         run: cargo test --workspace
+
+  mutants:
+    name: mutation testing (zephyra-core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@cargo-mutants
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Exit code 2 means some viable mutants survived. There is no score
+      # threshold: every surviving mutant must either be killed by a test or
+      # be explicitly approved as equivalent in .cargo/mutants.toml (exclude_re).
+      - name: Mutation testing
+        run: cargo mutants -p zephyra-core --jobs 4
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-report
+          path: mutants.out
+          if-no-files-found: ignore

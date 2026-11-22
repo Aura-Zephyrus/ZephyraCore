@@ -8,7 +8,8 @@
 //! `cargo test -p zephyra-core hit`。
 
 use crate::input::pointer::PointerPhase;
-use crate::input::router::{InputRouter, RoutedEvent};
+// 本模块是 router 的子模块，可直接调用其私有的 RoutedEvents::push 来压测容量边界。
+use crate::input::router::{InputRouter, RoutedEvent, RoutedEvents, MAX_EVENTS_PER_INPUT};
 use crate::test_support::{ev, route, tree, two_buttons};
 
 #[test]
@@ -238,4 +239,117 @@ fn a_two_finger_pinch_is_reported_alongside_hover_changes() {
         "第二指按下应激活捏合并产出手势，实得 {events:?}"
     );
     assert_eq!(router.pointer_count(), 2);
+}
+
+// ============================== 退化：容量边界 ==============================
+
+/// 缓冲恰好装满时，所有 MAX_EVENTS_PER_INPUT 条都必须可迭代取回，一条不少。
+#[test]
+fn routed_events_holds_exactly_max_events() {
+    let mut out = RoutedEvents::new();
+    assert!(out.is_empty());
+    assert_eq!(out.len(), 0);
+
+    for _ in 0..MAX_EVENTS_PER_INPUT {
+        out.push(RoutedEvent::Press("a".into()));
+    }
+    assert_eq!(out.len(), MAX_EVENTS_PER_INPUT);
+    assert!(!out.is_empty());
+    assert_eq!(
+        out.iter()
+            .filter(|e| matches!(e, RoutedEvent::Press(k) if k.as_name() == Some("a")))
+            .count(),
+        MAX_EVENTS_PER_INPUT,
+        "装满时不得有事件被静默丢弃"
+    );
+}
+
+/// 第 MAX+1 条 push 命中 debug_assert!(false)：热路径不 panic 是发布构建的
+/// 兜底，debug 构建必须把「状态机产出超出推导容量」这个 bug 暴露出来。
+#[test]
+#[should_panic(expected = "路由事件超出")]
+fn pushing_one_past_max_events_trips_the_debug_guard() {
+    let mut out = RoutedEvents::new();
+    for _ in 0..MAX_EVENTS_PER_INPUT {
+        out.push(RoutedEvent::Press("a".into()));
+    }
+    out.push(RoutedEvent::Release {
+        pressed: "a".into(),
+        released: None,
+    });
+}
+
+/// `set_pressed_for` 满表退化：第 9 根手指按下时不再写入 `pressed_by_pointer`，
+/// 但「主按下态」仍要更新为最近按下的键；其抬起不应产出 Release/Click。
+#[test]
+fn ninth_pointer_press_degrades_to_primary_only() {
+    let node = tree(&two_buttons());
+    let mut router = InputRouter::new();
+    let max = crate::input::pointer::MAX_POINTERS;
+
+    for id in 1..=max as u64 {
+        route(&mut router, &node, ev(id, 10.0, 10.0, PointerPhase::Down));
+    }
+    assert_eq!(router.pressed_keys().count(), max, "8 根手指应填满按指针表");
+    assert_eq!(router.pressed().and_then(|k| k.as_name()), Some("a"));
+
+    // 第 9 根按 b：满表 ⇒ 不新增条目，主按下态落到 b。
+    let events = route(&mut router, &node, ev(9, 60.0, 10.0, PointerPhase::Down));
+    assert!(
+        matches!(events.first(), Some(RoutedEvent::Press(k)) if k.as_name() == Some("b")),
+        "满表退化时仍应产出 Press b，实得 {events:?}"
+    );
+    assert_eq!(
+        router.pressed_keys().count(),
+        max,
+        "满表时不得写入第 9 个按下态"
+    );
+    assert_eq!(
+        router.pressed().and_then(|k| k.as_name()),
+        Some("b"),
+        "主按下态必须是最近一次按下的键"
+    );
+
+    // 未登记的指针抬起：取不到按下态 ⇒ 不产出 Release/Click，主按下态回落到剩余项。
+    let events = route(&mut router, &node, ev(9, 60.0, 10.0, PointerPhase::Up));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, RoutedEvent::Click(_) | RoutedEvent::Release { .. })),
+        "未登记指针的抬起不得误提交，实得 {events:?}"
+    );
+    assert_eq!(router.pressed().and_then(|k| k.as_name()), Some("a"));
+}
+
+/// revision 是「状态是否变化」的版本号，不是「事件发生了几次」。
+/// 用字面量把每一次 bump 的时机钉住。
+#[test]
+fn revision_bumps_only_on_real_state_changes() {
+    let node = tree(&two_buttons());
+    let mut router = InputRouter::new();
+    assert_eq!(router.revision(), 0);
+
+    // 空白处移动：悬停本来就是 None ⇒ 不变。
+    route(&mut router, &node, ev(1, 150.0, 150.0, PointerPhase::Move));
+    assert_eq!(router.revision(), 0);
+
+    // None → a：+1
+    route(&mut router, &node, ev(1, 10.0, 10.0, PointerPhase::Move));
+    assert_eq!(router.revision(), 1);
+
+    // 同位置重复 Move：不变。
+    route(&mut router, &node, ev(1, 10.0, 10.0, PointerPhase::Move));
+    assert_eq!(router.revision(), 1);
+
+    // 空白处按下：没有命中目标 ⇒ 不 press、不 bump。
+    route(&mut router, &node, ev(1, 150.0, 150.0, PointerPhase::Down));
+    assert_eq!(router.revision(), 1);
+
+    // a 上按下：+1
+    route(&mut router, &node, ev(1, 10.0, 10.0, PointerPhase::Down));
+    assert_eq!(router.revision(), 2);
+
+    // a 上抬起：Release+Click ⇒ +1（悬停已是 a，不再单独变化）。
+    route(&mut router, &node, ev(1, 10.0, 10.0, PointerPhase::Up));
+    assert_eq!(router.revision(), 3);
 }

@@ -1,0 +1,35 @@
+# cargo-mutants 配置：只变异 zephyra-core 库层。
+#
+# 运行（workspace root）：
+#   cargo mutants -p zephyra-core --in-place
+# `--in-place` 只能由命令行给出（见 cargo-mutants options.rs），故不写在这里。
+
+# 只变异 core 的自有逻辑源码；本仓其它 crate 不在本轮范围。
+examine_globs = ["zephyra-core/src/**/*.rs"]
+
+# 纯 re-export 空壳：几何/排版/滤镜/图标解析等算法实际住在 git 依赖
+# zephyra-vector，本仓这 5 个文件只是 `pub use`，没有可变异的业务逻辑。
+exclude_globs = [
+  "zephyra-core/src/core.rs",
+  "zephyra-core/src/decoration.rs",
+  "zephyra-core/src/filter.rs",
+  "zephyra-core/src/icon/mod.rs",
+  "zephyra-core/src/text/mod.rs",
+]
+
+# 每个变异都只跑 core 的测试（core 是纯计算、跨平台 crate）。
+test_package = ["zephyra-core"]
+
+# 输出目录（相对 workspace root）。
+output = "mutants.out"
+
+# core 测试基线 < 5s，给宽松倍数避免偶发超时误杀。
+timeout_multiplier = 4.0
+build_timeout_multiplier = 4.0
+
+# 复制 target 让每个变异体增量构建（8.76 GB）。
+# 必须把 TEMP/TMP 指向大容量磁盘（本机 C 盘仅剩 3 GB），否则复制会失败。
+copy_target = true
+
+# 保留默认 skip_calls（如 Vec::with_capacity 这类无业务语义的调用）。
+skip_calls_defaults = true

@@ -259,10 +259,15 @@ impl Theme {
     /// 内置浅色主题。
     pub fn light() -> Theme {
         let palette = Palette {
-            neutral_0: Color::rgb(1.0, 1.0, 1.0),
+            // RinUI light.qml:52 的 backgroundColor 是 #F3F3F3，这里当初误填成纯白，
+            // 于是那套「白 alpha 叠底」的结构令牌（card / layer / control_secondary…
+            // ）合成出来正好等于 surface —— 卡片、圆角边框、hover 全部消失。
+            // 用 Apple systemGroupedBackground #F2F2F7 同样能恢复层级。
+            neutral_0: Color::rgb(0.949, 0.949, 0.969),
             neutral_100: Color::rgb(0.973, 0.976, 0.980),
-            neutral_200: Color::rgb(0.933, 0.941, 0.949),
-            neutral_300: Color::rgb(0.863, 0.882, 0.902),
+            // Apple systemGray5 / systemGray4：hover 与 pressed 要有明显的两级差。
+            neutral_200: Color::rgb(0.898, 0.898, 0.918),
+            neutral_300: Color::rgb(0.820, 0.820, 0.839),
             neutral_400: Color::rgb(0.541, 0.573, 0.604),
             neutral_500: Color::rgb(0.400, 0.427, 0.455),
             neutral_600: Color::rgb(0.118, 0.133, 0.149),
@@ -293,7 +298,7 @@ impl Theme {
             focus_inner: Color::rgb(1.0, 1.0, 1.0),
             card: Color::rgba(1.0, 1.0, 1.0, 0.7),
             card_secondary: Color::rgba(0.976, 0.976, 0.976, 0.5),
-            card_border: Color::rgba(0.0, 0.0, 0.0, 0.0578),
+            card_border: Color::rgba(0.0, 0.0, 0.0, 0.12),
             control_secondary: Color::rgba(0.976, 0.976, 0.976, 0.5),
             control_tertiary: Color::rgba(0.976, 0.976, 0.976, 0.3),
             control_strong: Color::rgba(0.0, 0.0, 0.0, 0.4458),
@@ -303,9 +308,9 @@ impl Theme {
                 0x59 as f32 / 255.0,
             ),
             switch_track: Color::rgba(120.0 / 255.0, 120.0 / 255.0, 120.0 / 255.0, 0.2),
-            control_border: Color::rgba(0.0, 0.0, 0.0, 0.06),
+            control_border: Color::rgba(0.0, 0.0, 0.0, 0.10),
             control_border_strong: Color::rgba(0.0, 0.0, 0.0, 0.6063),
-            divider: Color::rgba(0.0, 0.0, 0.0, 0.0803),
+            divider: Color::rgba(0.0, 0.0, 0.0, 0.16),
             layer: Color::rgba(1.0, 1.0, 1.0, 0.5),
             success: Color::rgb(
                 0x0f as f32 / 255.0,

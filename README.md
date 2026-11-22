@@ -38,6 +38,25 @@ cargo test --workspace
 `default-members` 只含核心与编译器（纯计算、跨平台）；后端按需 `-p` 选择，
 避免默认构建拉入 Windows COM / D3D / Vulkan 的平台依赖树。
 
+## 变异测试
+
+core 的测试质量由 `cargo-mutants` 验证：
+
+```bash
+cargo install cargo-mutants --locked
+cargo mutants -p zephyra-core --jobs 8
+```
+
+配置在 `.cargo/mutants.toml`：只变异 `zephyra-core` 的 30 个自有逻辑文件；
+`core.rs` / `decoration.rs` / `filter.rs` / `icon/mod.rs` / `text/mod.rs` 是纯 `pub use`
+空壳（算法在 git 依赖 `zephyra-vector`），显式排除。
+
+CI 的 `mutants` job 每个 PR 跑全量。它**不设分数硬线**，但任何未被测试杀死的变异都会
+让 job 失败（`cargo-mutants` 退出码 2）。确认无害的等价变异必须在 `.cargo/mutants.toml`
+的 `exclude_re` 中显式列出并写明理由——这就是"测试准确性"的门禁。
+
+等价变异的裁决规则、已补测试清单与全量运行记录见 `zephyra-core/MUTATION_TESTING.md`。
+
 ## 发版
 
 - tag `v0.2.0` = core + 编译器 + fx + 全部后端。CLI 脚手架与主仓的控件层固定于此。

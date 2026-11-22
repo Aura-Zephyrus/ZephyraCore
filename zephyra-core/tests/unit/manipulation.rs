@@ -146,3 +146,47 @@ fn an_idle_delta_reports_itself_as_idle() {
     let d = s.on_move(&t, 16);
     assert!(d.is_idle(), "没动过就不该产出增量");
 }
+
+/// 同一毫秒内的第二个事件：`dt_ms = 0`。此时不能做除法（会得到 inf/NaN），
+/// 也不能退化成 0；必须沿用上一帧速度。
+#[test]
+fn zero_dt_reuses_previous_velocity() {
+    let mut s = ManipulationState::new();
+    let mut t = table(&[(0, 0.0, 0.0)]);
+    s.on_down(&t, 0);
+
+    t.move_pointer(0, 20.0, 0.0);
+    let first = s.on_move(&t, 100);
+    assert_eq!(first.velocity_x, 200.0, "20px/100ms = 200px/s");
+
+    t.move_pointer(0, 40.0, 0.0);
+    let second = s.on_move(&t, 100); // 与上一帧同毫秒 ⇒ dt_ms = 0
+    assert_eq!(
+        second.velocity_x, 200.0,
+        "dt=0 必须沿用上一帧速度，不是 0 也不是 inf"
+    );
+    assert_eq!(second.velocity_y, 0.0);
+    assert!(second.velocity_x.is_finite(), "dt=0 的除零必须被拦住");
+    assert_eq!(s.velocity(), (200.0, 0.0), "状态里的速度也应保持");
+}
+
+/// `normalize_angle` 归一到 (-π, π]：+π 是闭端（保持 π），-π 是开端（折到 +π）。
+/// 这两个边界直接钉死 `a > PI` / `a <= -PI` 的严格性（改成 >= / < 就会翻车）。
+#[test]
+fn normalize_angle_half_open_pi_boundaries() {
+    use std::f32::consts::PI;
+
+    assert_eq!(normalize_angle(PI), PI, "+π 是闭端，应保持 +π");
+    assert_eq!(normalize_angle(-PI), PI, "-π 是开端，应折到 +π");
+
+    // 边界内侧不回绕
+    let just_below_pi = PI - 0.01;
+    assert_eq!(normalize_angle(just_below_pi), just_below_pi);
+    let just_above_neg_pi = -PI + 0.01;
+    assert_eq!(normalize_angle(just_above_neg_pi), just_above_neg_pi);
+
+    // 整圈外的两个方向都落在 (-π, π]
+    assert!((normalize_angle(3.0 * PI) - PI).abs() < 1e-6);
+    assert!((normalize_angle(-3.0 * PI) + PI).abs() < 1e-6);
+    assert!((normalize_angle(PI + 0.1) - (-PI + 0.1)).abs() < 1e-6);
+}

@@ -10,12 +10,14 @@
 //! 定位**：改命中只跑 `cargo test -p zephyra-core hit`，改路由只跑
 //! `cargo test -p zephyra-core input::router`。
 
+use super::intersect;
 use crate::core::{Point, Rect};
 use crate::element::Element;
-use crate::hit::{hit_test, HitResult, HitTestRequest, MAX_DEPTH};
-use crate::id::NodeTag;
+use crate::hit::{hit_test, HitNode, HitResult, HitTestRequest, MAX_DEPTH};
+use crate::id::{ElementKey, NodeTag};
 use crate::layout::{layout, Direction, Position};
 use crate::node::Node;
+use crate::paint::Layer;
 use crate::property::PropertyValue;
 use crate::props;
 use crate::test_support::{ctx, hitbox, tree, two_buttons};
@@ -308,4 +310,169 @@ fn the_scroll_viewport_itself_does_not_move_with_the_content() {
         Rect::new(0.0, 0.0, 100.0, 100.0),
         "滚动容器的盒子（视口）必须留在原位"
     );
+}
+
+// ============================== intersect / HitResult / rank / MAX_DEPTH ==============================
+
+/// `intersect` 是 `hit::walk` 叠加祖先裁剪区的实现：空交集必须返回**零尺寸**，
+/// 否则 `(x1-x0)` 为负，传给 `Rect` 后在下游变成诡异的负宽裁剪区。
+#[test]
+fn intersect_clamps_an_empty_overlap_to_zero_size() {
+    let a = Rect::new(0.0, 0.0, 10.0, 10.0);
+    let b = Rect::new(20.0, 20.0, 10.0, 10.0);
+    let r = intersect(a, b);
+    assert_eq!(r.x, 20.0);
+    assert_eq!(r.y, 20.0);
+    assert_eq!(r.width, 0.0, "空交集的宽不能是负数");
+    assert_eq!(r.height, 0.0, "空交集的高不能是负数");
+}
+
+#[test]
+fn intersect_returns_the_nonempty_overlapping_region() {
+    let a = Rect::new(0.0, 0.0, 10.0, 10.0);
+    let b = Rect::new(5.0, 4.0, 10.0, 10.0);
+    let r = intersect(a, b);
+    assert_eq!(r.x, 5.0);
+    assert_eq!(r.y, 4.0);
+    assert_eq!(r.width, 5.0);
+    assert_eq!(r.height, 6.0);
+}
+
+fn node(id: Option<ElementKey>, inside: bool, interactive: bool) -> HitNode {
+    HitNode {
+        id,
+        rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+        interactive,
+        inside,
+        drag_region: false,
+    }
+}
+
+/// `deepest` 要的是**最内层被命中的节点**（不管它可不可交互）；
+/// `target` 才是最后一个 `interactive && inside`。两者混用会让不可交互的子层
+/// 吞掉点击，或者让容器抢走按钮的事件。
+#[test]
+fn deepest_is_the_last_inside_node_even_when_it_is_not_interactive() {
+    let mut result = HitResult::default();
+    result
+        .path
+        .push(node(Some(ElementKey::Name("outer")), true, true));
+    result
+        .path
+        .push(node(Some(ElementKey::Name("clipped")), false, true));
+    result
+        .path
+        .push(node(Some(ElementKey::Name("inner")), true, false));
+
+    assert_eq!(
+        result.deepest().map(|n| n.id.clone()),
+        Some(Some(ElementKey::Name("inner"))),
+        "deepest 不应要求 interactive"
+    );
+    assert_eq!(
+        result.target().map(|n| n.id.clone()),
+        Some(Some(ElementKey::Name("outer"))),
+        "target 必须跳过不可交互的 inner，并跳过不在内的 clipped"
+    );
+    assert!(result.hit_any());
+}
+
+#[test]
+fn deepest_and_hit_any_are_false_when_no_node_is_inside() {
+    let mut result = HitResult::default();
+    assert!(result.deepest().is_none(), "空路径没有最深节点");
+    assert!(!result.hit_any(), "空路径没有命中任何节点");
+
+    result.path.push(node(None, false, false));
+    assert!(result.deepest().is_none(), "全在外时不能报 deepest");
+    assert!(!result.hit_any(), "全在外时不能报命中");
+
+    result.truncated = true;
+    result.clear();
+    assert_eq!(result.path.len(), 0, "clear 要清空路径");
+    assert!(!result.truncated, "clear 要清掉截断标记");
+}
+
+/// 两个重叠的手动定位盒子（相同图层、相同尺寸），供 rank 比较用。
+fn overlapping(id: &'static str, layer: Option<Layer>) -> Element {
+    let mut e = hitbox(id, 40.0, 40.0)
+        .with(&props::POSITION, PropertyValue::position(Position::Root))
+        .with(&props::LEFT, PropertyValue::float(10.0))
+        .with(&props::TOP, PropertyValue::float(10.0));
+    if let Some(l) = layer {
+        e = e.with(&props::LAYER, PropertyValue::layer(l));
+    }
+    e
+}
+
+/// rank 的第三分量是 preorder 且用 `>`：同图层下**后遍历的**节点胜出。
+#[test]
+fn later_preorder_wins_when_the_rank_is_equal() {
+    let root = Element::new(NodeTag::Box)
+        .with_children([overlapping("first", None), overlapping("second", None)]);
+    let result = hit_at(&tree(&root), 20.0, 20.0);
+    assert_eq!(
+        result.target().map(|n| n.id.clone()),
+        Some(Some(ElementKey::Name("second"))),
+        "同图层同 z 时后遍历的应该盖住先遍历的"
+    );
+}
+
+/// rank 的第一分量是 layer 且优先于 preorder：高图层即使在前面也赢。
+#[test]
+fn a_higher_layer_wins_regardless_of_preorder() {
+    let low_first = Element::new(NodeTag::Box).with_children([
+        overlapping("low", Some(Layer::Content)),
+        overlapping("high", Some(Layer::Popup)),
+    ]);
+    let result = hit_at(&tree(&low_first), 20.0, 20.0);
+    assert_eq!(
+        result.target().map(|n| n.id.clone()),
+        Some(Some(ElementKey::Name("high")))
+    );
+
+    let high_first = Element::new(NodeTag::Box).with_children([
+        overlapping("high_first", Some(Layer::Popup)),
+        overlapping("low_second", Some(Layer::Content)),
+    ]);
+    let result = hit_at(&tree(&high_first), 20.0, 20.0);
+    assert_eq!(
+        result.target().map(|n| n.id.clone()),
+        Some(Some(ElementKey::Name("high_first"))),
+        "高图层在前面时不能被后面的低图层抢走"
+    );
+}
+
+/// `MAX_DEPTH` 是事件冒泡链长度的硬上限；超过它要标记 `truncated` 并截到恰好 16 个。
+#[test]
+fn max_depth_caps_the_path_at_sixteen_nodes() {
+    assert_eq!(MAX_DEPTH, 16, "事件路径深度上限是契约");
+
+    let mut element = hitbox("bottom", 20.0, 20.0);
+    for _ in 0..MAX_DEPTH {
+        element = Element::new(NodeTag::Box)
+            .with_key("l")
+            .with(&props::WIDTH, PropertyValue::float(100.0))
+            .with(&props::HEIGHT, PropertyValue::float(100.0))
+            .with_children([element]);
+    }
+    let result = hit_at(&tree(&element), 10.0, 10.0);
+    assert!(result.truncated, "17 层路径应被截断");
+    assert_eq!(result.path.len(), MAX_DEPTH, "截断后路径长度恰好是上限");
+}
+
+#[test]
+fn a_path_of_exactly_max_depth_is_not_truncated() {
+    let mut element = hitbox("bottom", 20.0, 20.0);
+    for _ in 0..(MAX_DEPTH - 1) {
+        element = Element::new(NodeTag::Box)
+            .with_key("l")
+            .with(&props::WIDTH, PropertyValue::float(100.0))
+            .with(&props::HEIGHT, PropertyValue::float(100.0))
+            .with_children([element]);
+    }
+    let result = hit_at(&tree(&element), 10.0, 10.0);
+    assert!(!result.truncated, "恰好等于上限不该标截断");
+    assert_eq!(result.path.len(), MAX_DEPTH);
+    assert!(result.hit_any());
 }

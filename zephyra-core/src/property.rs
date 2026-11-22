@@ -453,7 +453,12 @@ impl PartialEq for PropertyValue {
                 PropertyValue::Custom { inner: ai, eq },
                 PropertyValue::Custom { inner: bi, eq: eqi },
             ) => {
-                ai.type_id() == bi.type_id()
+                // `ai` is `&Arc<dyn Any + Send + Sync>`: calling `type_id()` on the
+                // Arc itself would resolve to `Any::type_id` for the wrapper
+                // `Arc<dyn Any + Send + Sync>` (a `'static` concrete type), which is
+                // always the same TypeId. Deref to the trait object to compare the
+                // *inner* concrete types.
+                (**ai).type_id() == (**bi).type_id()
                     && eq(&**ai, &**bi)
                     && std::ptr::eq(*eq as *const (), *eqi as *const ())
             }

@@ -325,6 +325,38 @@ fn light_and_dark_differ_visibly() {
 }
 
 #[test]
+fn structural_overlays_stay_visible_over_surface_in_both_themes() {
+    // 浅色主题曾把 RinUI light.qml 的 #F3F3F3 背景写成纯白，于是 card / layer 这些
+    // 白 alpha 叠出来正好等于 surface —— 卡片、16px 圆角边框、hover 全部消失。
+    // 之前的门禁只查「令牌存在/名字对齐」，查不出合成后同色，所以补这一条。
+    fn luminance(c: Color) -> f32 {
+        0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
+    }
+    for variant in [ThemeVariant::Light, ThemeVariant::Dark] {
+        let theme = Theme::builtin(variant);
+        let surface = theme.surface;
+        for role in [
+            roles::CARD,
+            roles::CARD_BORDER,
+            roles::LAYER,
+            roles::FOCUS_INNER,
+            roles::CONTROL_SECONDARY,
+            roles::CONTROL_TERTIARY,
+        ] {
+            let color = theme
+                .role(role)
+                .unwrap_or_else(|| panic!("{variant:?} 缺少角色 {role}"));
+            let composited = color.over(surface);
+            let delta = (luminance(composited) - luminance(surface)).abs();
+            assert!(
+                delta >= 0.004,
+                "{variant:?} 的 {role} 叠在 surface 上只差 {delta:.4}，层级会被抹平"
+            );
+        }
+    }
+}
+
+#[test]
 fn theme_toggle_round_trips() {
     let mut ctx = crate::theme::ThemeContext::new(ThemeVariant::Dark);
     assert_eq!(ctx.theme().variant, ThemeVariant::Dark);
