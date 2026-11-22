@@ -72,8 +72,12 @@ cargo mutants -p zephyra-core --jobs 8
 `property_store_tests.rs::custom_eq_rejects_different_inner_types_even_with_same_eq_pointer`
 钉死。
 
-**当前门禁**：`cargo fmt --all -- --check`、`cargo clippy -p zephyra-core --all-targets -- -D warnings`、
-`cargo test -p zephyra-core` 全部通过（538 passed / 1 ignored）。
+**当前门禁**（本机最终实测）：`cargo fmt --all -- --check`、`cargo clippy -p zephyra-core --all-targets -- -D warnings`、
+`cargo test --workspace` 全部通过（workspace 共 1284 passed）；core 本身 538 passed / 1 ignored。
+
+期间修正了 `theme_tests.rs` 中 7 处按旧版本猜测的浅色期望色值（surface/stroke/control_fill_hover/
+control_fill_pressed/card_border/control_border/divider），使其逐条对应 `theme.rs::light()` 的权威
+palette 定义——这类"测试值与实现漂移"正是变异测试要防的假绿来源。
 
 **全量变异测试**：本轮因单次运行耗时很长，按用户要求暂缓，待后续执行；执行后把
 变异分数、存活变异逐条裁决结果回填到本文件。
