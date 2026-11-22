@@ -38,8 +38,63 @@ jobs:
         run: cargo test --workspace
 
   mutants:
-    name: mutation testing (zephyra-core)
+    name: mutation testing (${{ matrix.crate }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 每个 crate 一份独立配置；zephyra-core 沿用 workspace 根的 master 配置。
+        # 平台/设备绑定 crate 的配置文件只圈定可在 headless 环境运行的纯 helper，
+        # 取舍说明见 zephyra-core/MUTATION_TESTING.md。
+        include:
+          - crate: zephyra-core
+            config: .cargo/mutants.toml
+          - crate: zephyra-bezier
+            config: .cargo/mutants/zephyra-bezier.toml
+          - crate: zephyra-style
+            config: .cargo/mutants/zephyra-style.toml
+          - crate: zstyle-compile
+            config: .cargo/mutants/zstyle-compile.toml
+          - crate: zypui
+            config: .cargo/mutants/zypui.toml
+          - crate: zypui-compile
+            config: .cargo/mutants/zypui-compile.toml
+          - crate: zephyra-fx
+            config: .cargo/mutants/zephyra-fx.toml
+          - crate: zephyra-svg-anim
+            config: .cargo/mutants/zephyra-svg-anim.toml
+          - crate: zephyra-render-ext
+            config: .cargo/mutants/zephyra-render-ext.toml
+          - crate: zephyra-ext
+            config: .cargo/mutants/zephyra-ext.toml
+          - crate: zephyra-ext-wgpu
+            config: .cargo/mutants/zephyra-ext-wgpu.toml
+          - crate: zephyra-platform
+            config: .cargo/mutants/zephyra-platform.toml
+          - crate: zephyra-platform-linux
+            config: .cargo/mutants/zephyra-platform-linux.toml
+          - crate: zephyra-platform-win
+            config: .cargo/mutants/zephyra-platform-win.toml
+          - crate: zephyra-app-config
+            config: .cargo/mutants/zephyra-app-config.toml
+          - crate: zephyra-window
+            config: .cargo/mutants/zephyra-window.toml
+          - crate: zephyra-winit-input
+            config: .cargo/mutants/zephyra-winit-input.toml
+          - crate: zephyra-winit
+            config: .cargo/mutants/zephyra-winit.toml
+          - crate: zephyra-winit-d3d12
+            config: .cargo/mutants/zephyra-winit-d3d12.toml
+          - crate: zephyra-vulkan
+            config: .cargo/mutants/zephyra-vulkan.toml
+          - crate: zephyra-dcomp
+            config: .cargo/mutants/zephyra-dcomp.toml
+          - crate: zephyra-media
+            config: .cargo/mutants/zephyra-media.toml
+          - crate: zephyra-uia
+            config: .cargo/mutants/zephyra-uia.toml
+          - crate: zephyra-camera
+            config: .cargo/mutants/zephyra-camera.toml
     steps:
       - uses: actions/checkout@v4
 
@@ -54,14 +109,14 @@ jobs:
 
       # Exit code 2 means some viable mutants survived. There is no score
       # threshold: every surviving mutant must either be killed by a test or
-      # be explicitly approved as equivalent in .cargo/mutants.toml (exclude_re).
+      # be explicitly approved as equivalent in that crate's config (exclude_re).
       - name: Mutation testing
-        run: cargo mutants -p zephyra-core --jobs 4
+        run: cargo mutants -p ${{ matrix.crate }} --config ${{ matrix.config }} --jobs 4
 
       - name: Upload mutation report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mutants-report
+          name: mutants-report-${{ matrix.crate }}
           path: mutants.out
           if-no-files-found: ignore

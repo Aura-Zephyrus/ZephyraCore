@@ -1,0 +1,29 @@
+# cargo-mutants 配置：zephyra-winit（BASE 集，D3D11 后端）。
+# 运行（workspace root）：
+#   cargo mutants -p zephyra-winit --config .cargo/mutants/zephyra-winit.toml --in-place
+# `--in-place` 只能由命令行给出（见 cargo-mutants options.rs），故不写在这里。
+
+# 平台 crate 的有意收窄：真实 GPU/D3D11 路径的测试带 #[ignore]（见 tests/
+# command_validation.rs、ext_contract_stubs.rs），headless 环境跑不到，无法杀死
+# 变异体；只变异有可执行单元测试的纯 helper（renderer.rs / shader.rs）。
+# 这是"覆盖全部 crate"与"不制造永久存活的假红"之间的有意折中，详见
+# zephyra-core/MUTATION_TESTING.md 的"平台 crate 作用域"。
+examine_globs = [
+  "zephyra-base/zephyra-winit/src/renderer.rs",
+  "zephyra-base/zephyra-winit/src/shader.rs",
+]
+
+test_package = ["zephyra-winit"]
+
+output = "mutants.out/zephyra-winit"
+
+timeout_multiplier = 4.0
+build_timeout_multiplier = 4.0
+
+copy_target = false
+skip_calls_defaults = true
+
+# 等价变异裁决：确认无行为差异后，把其 `--list` 名称的正则写入 exclude_re
+# （schema: 字符串数组，正则匹配 `cargo mutants --list` 输出的名称），逐条写明理由。
+# 不允许宽泛正则批量豁免；流程见 zephyra-core/MUTATION_TESTING.md。
+# exclude_re = ["replace <exact mutant name from --list> with its anchored regex"]

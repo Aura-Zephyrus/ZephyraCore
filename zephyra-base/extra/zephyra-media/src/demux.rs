@@ -189,3 +189,99 @@ pub(crate) fn video_codec_from(name: &str) -> Option<zephyra_video::VideoCodec> 
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_us_scales_seconds_and_frac_with_truncation() {
+        // 1 tick = 1 us。
+        assert_eq!(to_us(TimeBase::new(1, 1_000_000), 0), 0);
+        assert_eq!(to_us(TimeBase::new(1, 1_000_000), 1), 1);
+        assert_eq!(to_us(TimeBase::new(1, 1_000_000), 1_234_567), 1_234_567);
+        // 1 tick = 1 ms，seconds 部分也要乘 1e6。
+        assert_eq!(to_us(TimeBase::new(1, 1_000), 1), 1_000);
+        assert_eq!(to_us(TimeBase::new(1, 1_000), 2_500), 2_500_000);
+        // 1/3 秒 = 333_333.33... us，float → i64 是截断而非四舍五入。
+        assert_eq!(to_us(TimeBase::new(1, 3), 1), 333_333);
+        assert_eq!(to_us(TimeBase::new(1, 3), 3), 1_000_000);
+    }
+
+    #[test]
+    fn find_avcc_pins_returned_offset_and_tail() {
+        assert_eq!(find_avcc(b""), None);
+        assert_eq!(find_avcc(b"no tag here"), None);
+        // 当前实现返回 i + tag.len()，即包含随后 4 字节的 box size 字段。
+        assert_eq!(
+            find_avcc(b"avcC\x00\x00\x00\x05\x01\x02"),
+            Some(&b"\x00\x00\x00\x05\x01\x02"[..])
+        );
+        // 前置字节不参与偏移计算。
+        assert_eq!(
+            find_avcc(b"ab_avcC\xde\xad\xbe\xef\x77"),
+            Some(&b"\xde\xad\xbe\xef\x77"[..])
+        );
+        // 多处出现时取第一处。
+        assert_eq!(
+            find_avcc(b"avcC\x00\x00\x00\x00avcC\x01\x02\x03\x04\x09"),
+            Some(&b"\x00\x00\x00\x00avcC\x01\x02\x03\x04\x09"[..])
+        );
+        // tag 恰好在末尾 → 返回空 slice。
+        assert_eq!(find_avcc(b"zzavcC"), Some(&b""[..]));
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn audio_codec_from_is_case_insensitive_and_ordered() {
+        use zephyra_video::AudioCodec;
+
+        assert_eq!(audio_codec_from("MP3"), Some(AudioCodec::Mp3));
+        assert_eq!(audio_codec_from("oPuS"), Some(AudioCodec::Opus));
+        assert_eq!(audio_codec_from("Vorbis"), Some(AudioCodec::Vorbis));
+        assert_eq!(audio_codec_from("FLAC"), Some(AudioCodec::Flac));
+        assert_eq!(audio_codec_from("pCm"), Some(AudioCodec::Pcm));
+        assert_eq!(audio_codec_from(""), None);
+        assert_eq!(audio_codec_from("aac"), None);
+
+        // 子串命中，且按 mp3 → opus → vorbis → flac → pcm 的优先级短路。
+        assert_eq!(
+            audio_codec_from("mp3opusvorbisflacpcm"),
+            Some(AudioCodec::Mp3)
+        );
+        assert_eq!(
+            audio_codec_from("opusvorbisflacpcm"),
+            Some(AudioCodec::Opus)
+        );
+        assert_eq!(audio_codec_from("vorbisflacpcm"), Some(AudioCodec::Vorbis));
+        assert_eq!(audio_codec_from("flacpcm"), Some(AudioCodec::Flac));
+        assert_eq!(audio_codec_from("pcmxxx"), Some(AudioCodec::Pcm));
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn video_codec_from_is_case_insensitive_and_ordered() {
+        use zephyra_video::VideoCodec;
+
+        assert_eq!(video_codec_from("H264"), Some(VideoCodec::H264));
+        assert_eq!(video_codec_from("avc1"), Some(VideoCodec::H264));
+        assert_eq!(video_codec_from("HEVC"), Some(VideoCodec::HEVC));
+        assert_eq!(video_codec_from("h265"), Some(VideoCodec::HEVC));
+        assert_eq!(video_codec_from("AV1"), Some(VideoCodec::AV1));
+        assert_eq!(video_codec_from("VP9"), Some(VideoCodec::VP9));
+        assert_eq!(video_codec_from("vp8"), Some(VideoCodec::VP8));
+        assert_eq!(video_codec_from("Theora"), Some(VideoCodec::Theora));
+        assert_eq!(video_codec_from("MJPEG"), Some(VideoCodec::Mjpeg));
+        assert_eq!(video_codec_from("vvc"), Some(VideoCodec::Vvc));
+        assert_eq!(video_codec_from("h266"), Some(VideoCodec::Vvc));
+        assert_eq!(video_codec_from("evc"), Some(VideoCodec::Evc));
+        assert_eq!(video_codec_from(""), None);
+        assert_eq!(video_codec_from("aac"), None);
+
+        // 先匹配到的别名优先。
+        assert_eq!(video_codec_from("avc1hevc"), Some(VideoCodec::H264));
+        assert_eq!(video_codec_from("H265AV1"), Some(VideoCodec::HEVC));
+        assert_eq!(video_codec_from("AV1VP9VP8"), Some(VideoCodec::AV1));
+        assert_eq!(video_codec_from("vp9vp8"), Some(VideoCodec::VP9));
+    }
+}

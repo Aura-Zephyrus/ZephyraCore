@@ -40,20 +40,54 @@ cargo test --workspace
 
 ## 变异测试
 
-core 的测试质量由 `cargo-mutants` 验证：
+全仓 CORE + BASE 共 **24 个 crate** 的测试质量由 `cargo-mutants` 验证：把源码注入 bug，
+看测试是否失败。每个 crate 一份配置，`-p` 与 `--config` 必须成对给出。
+
+| 集合 | crate | 配置 |
+|---|---|---|
+| core | `zephyra-core` | `.cargo/mutants.toml`（master） |
+| CORE（7） | `zephyra-bezier`、`zephyra-style`、`zstyle-compile`、`zypui`、`zypui-compile`、`zephyra-fx`、`zephyra-svg-anim` | `.cargo/mutants/<crate>.toml` |
+| BASE（13） | `zephyra-render-ext`、`zephyra-ext`、`zephyra-ext-wgpu`、`zephyra-platform`、`zephyra-platform-linux`、`zephyra-platform-win`、`zephyra-app-config`、`zephyra-window`、`zephyra-winit-input`、`zephyra-winit`、`zephyra-winit-d3d12`、`zephyra-vulkan`、`zephyra-dcomp` | `.cargo/mutants/<crate>.toml` |
+| BASE/extra（3） | `zephyra-media`、`zephyra-uia`、`zephyra-camera` | `.cargo/mutants/<crate>.toml` |
+
+本地运行（workspace root）：
 
 ```bash
-cargo install cargo-mutants --locked
+cargo install cargo-mutants --locked   # 已装可跳过
+
+# Windows：master 配置 copy_target = true，会把约 8.8 GB 的 target 复制进临时目录换增量编译；
+# C 盘空间不足时必须把 TEMP/TMP 指到大容量盘。
+$env:TEMP = 'E:\tmp'; $env:TMP = 'E:\tmp'
+$env:CARGO_TARGET_DIR = 'E:\tmp\zc-a11-target'
+
+# per-crate 配置均为 copy_target = false：可原地跑（不复制 target）
+cargo mutants -p zephyra-style --config .cargo/mutants/zephyra-style.toml --in-place
+
+# 或并行跑（--in-place 与 --jobs 互斥，二选一）
+cargo mutants -p zephyra-style --config .cargo/mutants/zephyra-style.toml --jobs 8
+
+# core 沿用 master 配置（copy_target = true），并行时不要加 --in-place
 cargo mutants -p zephyra-core --jobs 8
 ```
 
-配置在 `.cargo/mutants.toml`：只变异 `zephyra-core` 的 30 个自有逻辑文件；
-`core.rs` / `decoration.rs` / `filter.rs` / `icon/mod.rs` / `text/mod.rs` 是纯 `pub use`
-空壳（算法在 git 依赖 `zephyra-vector`），显式排除。
+`--in-place` 只能由命令行给出（见 cargo-mutants options.rs），不写进配置；配置中的
+`copy_target` 决定是否复制 `target` 以获取增量构建。`exclude_re` 是等价变异的唯一豁免口：
+字符串数组，正则匹配 `cargo mutants --list` 输出的名称，必须逐条写明理由。
 
-CI 的 `mutants` job 每个 PR 跑全量。它**不设分数硬线**，但任何未被测试杀死的变异都会
-让 job 失败（`cargo-mutants` 退出码 2）。确认无害的等价变异必须在 `.cargo/mutants.toml`
-的 `exclude_re` 中显式列出并写明理由——这就是"测试准确性"的门禁。
+**平台/设备 crate 的作用域（有意折中）**：`zephyra-winit` / `zephyra-winit-d3d12`
+只变异 `renderer.rs` / `shader.rs` / `swapchain.rs`，`zephyra-vulkan` 只变异 `ext.rs`，
+`zephyra-dcomp` 只变异 `lib.rs`，`zephyra-platform-win` 只变异 `version.rs` / `locale.rs` /
+`live_resize.rs`，`zephyra-uia` 只变异 `model.rs` / `rules.rs`，`zephyra-camera` 只变异
+`pixels.rs` / `quality.rs` / `recovery.rs` / `device.rs` / `controls.rs`，`zephyra-media`
+只变异 `output.rs` / `demux.rs` / `decode_thread.rs` / `video.rs` / `clock.rs` / `error.rs`。
+真实 GPU / DComp / Vulkan ICD / 摄像头 / 音频设备的路径其测试都带 `#[ignore]`，headless
+环境根本跑不到，无法杀死变异体；把这些文件圈进来只会制造永久存活的假红。这是"覆盖全部
+crate"与"每个存活变异都可裁决"之间的明确取舍，详见 `zephyra-core/MUTATION_TESTING.md`。
+
+CI 的 `mutants` job 是 24 路矩阵，每个 PR 对每 crate 跑全量，并上传独立报告。它**不设分数
+硬线**，但任何未被测试杀死的变异都会让 job 失败（`cargo-mutants` 退出码 2）。存活变异按
+4 步裁决：① 补字面量断言的测试杀死它；② 证明等价后加入该 crate 配置的 `exclude_re` 并写
+理由；③ 不可编译变异（unviable）无需处理；④ 超时先查真死循环，确认阈值过低才调高倍数。
 
 等价变异的裁决规则、已补测试清单与全量运行记录见 `zephyra-core/MUTATION_TESTING.md`。
 

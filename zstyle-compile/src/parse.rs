@@ -151,6 +151,19 @@ pub(crate) struct ZstyleParser<'a> {
     pub(crate) errors: Vec<Error>,
 }
 
+/// 测试专用的最小构造器：让同 crate 的单元测试能直接驱动 `value.rs` 里的
+/// 纯解析函数，而不必先构造一份完整样式表。生产路径仍只走 [`parse`]。
+#[cfg(test)]
+pub(crate) fn test_parser<'a>(file: &'a str, css: &'a str) -> ZstyleParser<'a> {
+    ZstyleParser {
+        file,
+        css,
+        order: 0,
+        rules: Vec::new(),
+        errors: Vec::new(),
+    }
+}
+
 impl<'a> ZstyleParser<'a> {
     /// 按行号摘原文。
     pub(crate) fn line_text(&self, line: u32) -> String {
@@ -538,4 +551,56 @@ fn parse_selector<'i>(
     }
 
     Ok(Selector { tag, names })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tag_by_name_recognizes_only_the_closed_four_lowercase_names() {
+        assert_eq!(tag_by_name("text"), Some(NodeTag::Text));
+        assert_eq!(tag_by_name("image"), Some(NodeTag::Image));
+        assert_eq!(tag_by_name("box"), Some(NodeTag::Box));
+        assert_eq!(tag_by_name("control"), Some(NodeTag::Control));
+
+        // 大小写敏感，且 `Container` 不是当前类型名（迁移另有入口）。
+        assert_eq!(tag_by_name("Text"), None);
+        assert_eq!(tag_by_name("Container"), None);
+        assert_eq!(tag_by_name("BOX"), None);
+        assert_eq!(tag_by_name("button"), None);
+        assert_eq!(tag_by_name(""), None);
+    }
+
+    #[test]
+    fn all_tag_names_lists_exactly_the_table_and_is_reversible() {
+        assert_eq!(all_tag_names(), vec!["text", "image", "box", "control"]);
+        // 表列出的每个名字都必须能查回一个类型（没有「列出来却认不出」的死名）。
+        for name in all_tag_names() {
+            assert!(tag_by_name(name).is_some(), "name={name}");
+        }
+        assert_eq!(all_tag_names().len(), TAG_NAMES.len());
+    }
+
+    #[test]
+    fn legacy_tag_migration_maps_exactly_four_uppercase_names() {
+        assert_eq!(legacy_tag_migration("Container"), Some("box"));
+        assert_eq!(legacy_tag_migration("Text"), Some("text"));
+        assert_eq!(legacy_tag_migration("Image"), Some("image"));
+        assert_eq!(legacy_tag_migration("Control"), Some("control"));
+
+        assert_eq!(legacy_tag_migration("container"), None);
+        assert_eq!(legacy_tag_migration("Box"), None);
+        assert_eq!(legacy_tag_migration("Control "), None);
+        assert_eq!(legacy_tag_migration(""), None);
+
+        // 迁移目标必须都是当前合法类型名，否则提示会把人引到死路上。
+        for old in ["Container", "Text", "Image", "Control"] {
+            let target = legacy_tag_migration(old).unwrap();
+            assert!(
+                tag_by_name(target).is_some(),
+                "{old} -> {target} is not a current type name"
+            );
+        }
+    }
 }

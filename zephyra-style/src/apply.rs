@@ -167,3 +167,110 @@ fn apply_node(
         node.retain_styled_props(|key| s.want.iter().any(|(k, _)| std::ptr::eq(*k, key)));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zephyra_core::core::Color;
+    use zephyra_core::diff::diff;
+    use zephyra_core::element::Element;
+    use zephyra_core::props;
+    use zephyra_core::styler::Styler;
+
+    use crate::ir::{Declaration, Selector, StyleRule};
+
+    const RED: Color = Color::rgb(1.0, 0.0, 0.0);
+    const BLUE: Color = Color::rgb(0.0, 0.0, 1.0);
+
+    fn bg(selector: Selector, color: Color, order: u32) -> StyleRule {
+        StyleRule::new(
+            selector,
+            vec![Declaration {
+                key: &props::BACKGROUND,
+                value: PropertyValue::color(color),
+            }],
+            order,
+        )
+    }
+
+    fn bg_of(node: &Node) -> Option<Color> {
+        node.props()
+            .lookup(&props::BACKGROUND)
+            .and_then(|(v, _)| v.get::<Color>())
+    }
+
+    #[test]
+    fn match_decls_skips_non_matching_rules_and_keeps_the_matching_one() {
+        let sheet = StyleSheet::from_rules(vec![
+            StyleRule::new(Selector::named("a"), Vec::new(), 0),
+            bg(Selector::tag(NodeTag::Box), Color::rgb(0.0, 1.0, 0.0), 1),
+            bg(Selector::named("other"), BLUE, 2),
+            bg(Selector::named("danger"), RED, 3),
+        ]);
+
+        let got = sheet.match_decls(NodeTag::Control, &["danger"]);
+        assert_eq!(got.len(), 1, "只有最后一条命中");
+        assert!(std::ptr::eq(got[0].0, &props::BACKGROUND));
+        assert_eq!(got[0].1.get::<Color>(), Some(RED));
+
+        let none = sheet.match_decls(NodeTag::Image, &[]);
+        assert!(none.is_empty(), "类型与分类名都不符时一条都不该命中");
+    }
+
+    #[test]
+    fn match_decls_upserts_repeated_keys_and_keeps_distinct_ones() {
+        let sheet = StyleSheet::from_rules(vec![StyleRule::new(
+            Selector::named("danger"),
+            vec![
+                Declaration {
+                    key: &props::BACKGROUND,
+                    value: PropertyValue::color(RED),
+                },
+                Declaration {
+                    key: &props::WIDTH,
+                    value: PropertyValue::float(10.0),
+                },
+                Declaration {
+                    key: &props::BACKGROUND,
+                    value: PropertyValue::color(BLUE),
+                },
+            ],
+            0,
+        )]);
+
+        let got = sheet.match_decls(NodeTag::Control, &["danger"]);
+        assert_eq!(got.len(), 2, "同一个键只占一个槽");
+        let bg = got
+            .iter()
+            .find(|(k, _)| std::ptr::eq(*k, &props::BACKGROUND))
+            .unwrap();
+        assert_eq!(bg.1.get::<Color>(), Some(BLUE), "后写的覆盖先写的");
+        let width = got
+            .iter()
+            .find(|(k, _)| std::ptr::eq(*k, &props::WIDTH))
+            .unwrap();
+        assert_eq!(width.1.get::<f32>(), Some(10.0));
+    }
+
+    #[test]
+    fn cached_styler_hits_the_cache_and_follows_class_changes() {
+        let sheet = StyleSheet::from_rules(vec![
+            bg(Selector::named("danger"), RED, 0),
+            bg(Selector::named("calm"), BLUE, 1),
+        ]);
+        // From<Arc<StyleSheet>> 与 Deref 都要可用。
+        let mut styler = SheetStyler::from(Arc::new(sheet));
+        assert_eq!(styler.rules().len(), 2);
+
+        let mut node = Node::from_element(&Element::new(NodeTag::Control).style("danger"));
+        styler.apply(&mut node); // miss：填缓存
+        assert_eq!(bg_of(&node), Some(RED));
+        styler.apply(&mut node); // hit：复用缓存
+        assert_eq!(bg_of(&node), Some(RED));
+
+        // 分类名变了 ⇒ 新键，必须重新匹配并把旧值拆掉。
+        diff(&mut node, &Element::new(NodeTag::Control).style("calm"));
+        styler.apply(&mut node);
+        assert_eq!(bg_of(&node), Some(BLUE));
+    }
+}

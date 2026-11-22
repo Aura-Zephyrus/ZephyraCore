@@ -417,3 +417,97 @@ fn ellipsis(s: &str) -> String {
         t.to_string()
     }
 }
+
+// ============================== 直接单测（实体/诊断/属性访问） ==============================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_entities_handles_all_five_named_entities() {
+        assert_eq!(decode_entities("&amp;"), "&");
+        assert_eq!(decode_entities("&lt;"), "<");
+        assert_eq!(decode_entities("&gt;"), ">");
+        assert_eq!(decode_entities("&quot;"), "\"");
+        assert_eq!(decode_entities("&apos;"), "'");
+        assert_eq!(decode_entities("&lt;a &amp; b&gt;"), "<a & b>");
+        assert_eq!(decode_entities("&quot;x&apos;"), "\"x'");
+    }
+
+    #[test]
+    fn decode_entities_no_ampersand_fast_path() {
+        assert_eq!(decode_entities(""), "");
+        assert_eq!(
+            decode_entities("plain <text> \"q\" 'a'"),
+            "plain <text> \"q\" 'a'"
+        );
+    }
+
+    #[test]
+    fn decode_entities_numeric_entities_are_deliberately_unsupported() {
+        // 本解析器只给五个命名实体（见函数文档）；数字写法原样透传。
+        assert_eq!(decode_entities("&#65;"), "&#65;");
+        assert_eq!(decode_entities("&#x41;"), "&#x41;");
+        assert_eq!(decode_entities("&#X41;"), "&#X41;");
+        assert_eq!(decode_entities("&#0;"), "&#0;");
+        assert_eq!(decode_entities("a &#x4e2d; b"), "a &#x4e2d; b");
+    }
+
+    #[test]
+    fn decode_entities_unknown_and_malformed_pass_through() {
+        assert_eq!(decode_entities("&nbsp;"), "&nbsp;");
+        assert_eq!(decode_entities("&AMP;"), "&AMP;");
+        assert_eq!(decode_entities("&amp"), "&amp");
+        assert_eq!(decode_entities("&"), "&");
+        assert_eq!(decode_entities("&&amp;"), "&&");
+        assert_eq!(decode_entities("&amp;&amp;"), "&&");
+        // 五次 replace 的顺序副作用：先解 `&amp;`，结果里的 `&lt;` 又被下一轮解成 `<`。
+        assert_eq!(decode_entities("&amp;lt;"), "<");
+    }
+
+    #[test]
+    fn diag_render_pins_both_levels() {
+        let e = Diag::error("a.zypui", 3, 7, "坏东西");
+        assert_eq!(e.render(), "a.zypui:3:7: error: 坏东西");
+
+        let w = Diag {
+            file: "b.zypui",
+            line: 12,
+            col: 34,
+            level: Level::Warning,
+            msg: "提醒".to_string(),
+        };
+        assert_eq!(w.render(), "b.zypui:12:34: warning: 提醒");
+
+        let manual = Diag {
+            file: "a.zypui",
+            line: 3,
+            col: 7,
+            level: Level::Error,
+            msg: "坏东西".to_string(),
+        };
+        assert_eq!(manual, e);
+        assert_eq!(manual.render(), e.render());
+    }
+
+    #[test]
+    fn xel_attr_finds_first_match_and_handles_missing() {
+        let el = XEl {
+            name: "box".to_string(),
+            attrs: vec![
+                ("key".to_string(), "first".to_string(), 1, 2),
+                ("class".to_string(), String::new(), 1, 8),
+                ("key".to_string(), "second".to_string(), 2, 2),
+            ],
+            children: Vec::new(),
+            text: String::new(),
+            line: 1,
+            col: 1,
+        };
+        assert_eq!(el.attr("key"), Some("first"));
+        assert_eq!(el.attr("class"), Some(""));
+        assert_eq!(el.attr("missing"), None);
+        assert_eq!(el.attr("Key"), None);
+    }
+}

@@ -153,3 +153,174 @@ fn duplicate_declarations(name: &str, sheet: &zephyra_style::ir::StyleSheet) -> 
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use zephyra_core::property::{PropertyKey, PropertyValue};
+    use zephyra_core::props;
+    use zephyra_style::ir::{Declaration, Selector, StyleRule, StyleSheet};
+
+    fn decl(key: &'static PropertyKey) -> Declaration {
+        Declaration {
+            key,
+            value: PropertyValue::float(1.0),
+        }
+    }
+
+    fn diag(level: Level, line: u32) -> Diag {
+        Diag {
+            level,
+            error: Error {
+                file: "t.zstyle".into(),
+                line_text: String::new(),
+                at: crate::errors::Pos { line, col: 1 },
+                underline_len: 0,
+                headline: String::new(),
+                near: Vec::new(),
+                hint: String::new(),
+            },
+        }
+    }
+
+    fn report(diagnostics: Vec<Diag>) -> FileReport {
+        FileReport {
+            path: PathBuf::from("t.zstyle"),
+            name: "t.zstyle".into(),
+            rules: Some(0),
+            diagnostics,
+        }
+    }
+
+    #[test]
+    fn duplicate_declarations_flags_only_repeats_within_one_block() {
+        let sheet = StyleSheet::from_rules(vec![
+            StyleRule::new(
+                Selector::named("a"),
+                vec![
+                    decl(&props::WIDTH),
+                    decl(&props::WIDTH),
+                    decl(&props::HEIGHT),
+                ],
+                0,
+            ),
+            StyleRule::new(Selector::named("b"), vec![decl(&props::WIDTH)], 1),
+        ]);
+
+        let diags = duplicate_declarations("t.zstyle", &sheet);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].level, Level::Warning);
+        assert_eq!(diags[0].error.file, "t.zstyle");
+        assert_eq!(
+            diags[0].error.headline,
+            "duplicate declaration of `Width` in the same block; the later one wins."
+        );
+        assert!(diags[0].error.hint.contains("remove the earlier one"));
+    }
+
+    #[test]
+    fn duplicate_declarations_reports_each_extra_declaration() {
+        let sheet = StyleSheet::from_rules(vec![StyleRule::new(
+            Selector::named("a"),
+            vec![
+                decl(&props::WIDTH),
+                decl(&props::WIDTH),
+                decl(&props::WIDTH),
+            ],
+            0,
+        )]);
+        let diags = duplicate_declarations("t.zstyle", &sheet);
+        assert_eq!(diags.len(), 2, "三条同键记录 ⇒ 后两条各报一次");
+        assert!(diags.iter().all(|d| d.level == Level::Warning));
+    }
+
+    #[test]
+    fn duplicate_declarations_compares_key_identity_not_names() {
+        // 别名（gap / spacing）是**同一个** `PropertyKey`，应视为重复。
+        let sheet = StyleSheet::from_rules(vec![StyleRule::new(
+            Selector::named("a"),
+            vec![decl(&props::SPACING), decl(&props::SPACING)],
+            0,
+        )]);
+        assert_eq!(duplicate_declarations("t.zstyle", &sheet).len(), 1);
+
+        // 不同键同名段的也不算重复（CROSS_ALIGN / MAIN_ALIGN 是两个键）。
+        let sheet = StyleSheet::from_rules(vec![StyleRule::new(
+            Selector::named("a"),
+            vec![decl(&props::CROSS_ALIGN), decl(&props::MAIN_ALIGN)],
+            0,
+        )]);
+        assert!(duplicate_declarations("t.zstyle", &sheet).is_empty());
+
+        // 不同块里的同名键互不干扰。
+        let sheet = StyleSheet::from_rules(vec![
+            StyleRule::new(Selector::named("a"), vec![decl(&props::WIDTH)], 0),
+            StyleRule::new(Selector::named("b"), vec![decl(&props::WIDTH)], 1),
+        ]);
+        assert!(duplicate_declarations("t.zstyle", &sheet).is_empty());
+    }
+
+    #[test]
+    fn check_text_reports_clean_text_errors_and_warnings() {
+        let clean = check_text(
+            Path::new("t.zstyle"),
+            "t.zstyle".into(),
+            "box { width: 1px; }",
+        );
+        assert_eq!(clean.path, Path::new("t.zstyle"));
+        assert_eq!(clean.name, "t.zstyle");
+        assert_eq!(clean.rules, Some(1));
+        assert!(clean.diagnostics.is_empty());
+
+        let duplicate = check_text(
+            Path::new("d.zstyle"),
+            "d.zstyle".into(),
+            "box { width: 1px; width: 2px; }",
+        );
+        assert_eq!(duplicate.rules, Some(1));
+        assert_eq!(duplicate.diagnostics.len(), 1);
+        assert_eq!(duplicate.diagnostics[0].level, Level::Warning);
+
+        let bad = check_text(
+            Path::new("e.zstyle"),
+            "e.zstyle".into(),
+            "box { coner-radius: 1px; }",
+        );
+        assert_eq!(bad.diagnostics.len(), 1);
+        assert_eq!(bad.diagnostics[0].level, Level::Error);
+        assert!(bad.diagnostics[0]
+            .error
+            .headline
+            .contains("unknown property"));
+    }
+
+    #[test]
+    fn check_text_sorts_diagnostics_by_source_position() {
+        let report = check_text(
+            Path::new("t.zstyle"),
+            "t.zstyle".into(),
+            "box { coner-radius: 1px; }\nbox { wdith: 2px; }",
+        );
+        let lines: Vec<u32> = report.diagnostics.iter().map(|d| d.error.at.line).collect();
+        assert_eq!(lines, vec![1, 2]);
+        assert!(report.diagnostics.iter().all(|d| d.level == Level::Error));
+    }
+
+    #[test]
+    fn has_errors_counts_only_error_level_diagnostics() {
+        assert!(!has_errors(&[]));
+        assert!(!has_errors(&[report(Vec::new())]));
+        assert!(!has_errors(&[report(vec![diag(Level::Warning, 1)])]));
+        assert!(has_errors(&[report(vec![diag(Level::Error, 1)])]));
+        assert!(
+            has_errors(&[
+                report(vec![diag(Level::Warning, 1)]),
+                report(vec![diag(Level::Error, 2)]),
+            ]),
+            "任一文件有错误就算有错"
+        );
+        assert_eq!(Level::Error.to_string(), "error");
+        assert_eq!(Level::Warning.to_string(), "warning");
+    }
+}

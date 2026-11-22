@@ -1,0 +1,25 @@
+# cargo-mutants 配置：zephyra-vulkan（BASE 集，裸 Vulkan/ash 后端）。
+# 运行（workspace root）：
+#   cargo mutants -p zephyra-vulkan --config .cargo/mutants/zephyra-vulkan.toml --in-place
+# `--in-place` 只能由命令行给出（见 cargo-mutants options.rs），故不写在这里。
+
+# 平台 crate 的有意收窄：renderer.rs 的测试与 tests/ext_contract_stubs.rs 带
+# #[ignore]（需要 Vulkan ICD / Wayland 设备），headless 环境无法杀死变异体；
+# 只变异纯资源记账 helper ext.rs（ExtPool / 纹理生命周期，不碰真实设备）。
+# 详见 zephyra-core/MUTATION_TESTING.md 的"平台 crate 作用域"。
+examine_globs = ["zephyra-base/zephyra-vulkan/src/ext.rs"]
+
+test_package = ["zephyra-vulkan"]
+
+output = "mutants.out/zephyra-vulkan"
+
+timeout_multiplier = 4.0
+build_timeout_multiplier = 4.0
+
+copy_target = false
+skip_calls_defaults = true
+
+# 等价变异裁决：确认无行为差异后，把其 `--list` 名称的正则写入 exclude_re
+# （schema: 字符串数组，正则匹配 `cargo mutants --list` 输出的名称），逐条写明理由。
+# 不允许宽泛正则批量豁免；流程见 zephyra-core/MUTATION_TESTING.md。
+# exclude_re = ["replace <exact mutant name from --list> with its anchored regex"]

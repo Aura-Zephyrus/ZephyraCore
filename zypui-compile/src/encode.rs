@@ -240,3 +240,271 @@ impl Writer {
         self.bytes(s.as_bytes());
     }
 }
+
+// ============================== 直接单测（逐字节钉住编码格式） ==============================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zypui::expr::BinOp;
+    use zypui::ir::{Component, ElementNode, ForNode, IfNode, Page, UseNode};
+
+    fn bytes_of_expr(e: &Expr) -> Vec<u8> {
+        let mut w = Writer::default();
+        expr(&mut w, e);
+        w.out
+    }
+
+    fn bytes_of_node(n: &Node) -> Vec<u8> {
+        let mut w = Writer::default();
+        node(&mut w, n);
+        w.out
+    }
+
+    fn bytes_of_tok(t: &ClassTok) -> Vec<u8> {
+        let mut w = Writer::default();
+        classtok(&mut w, t);
+        w.out
+    }
+
+    #[test]
+    fn writer_primitives_pin_little_endian_layout() {
+        let mut w = Writer::default();
+        assert!(w.out.is_empty());
+        w.bytes(&[0x01, 0x02]);
+        w.u8(0xFF);
+        w.u32(0x0102_0304);
+        w.str("AB");
+        assert_eq!(w.out, vec![1, 2, 0xFF, 4, 3, 2, 1, 2, 0, 0, 0, b'A', b'B']);
+        // str 用字节长度（中文 3 字节），不是字符数。
+        let mut w2 = Writer::default();
+        w2.str("中");
+        assert_eq!(w2.out, vec![3, 0, 0, 0, 0xE4, 0xB8, 0xAD]);
+    }
+
+    #[test]
+    fn expr_literals_and_names_pin_exact_bytes() {
+        assert_eq!(
+            bytes_of_expr(&Expr::LitS("hi")),
+            vec![0, 2, 0, 0, 0, b'h', b'i']
+        );
+        assert_eq!(bytes_of_expr(&Expr::LitF(1.0)), vec![1, 0, 0, 0x80, 0x3F]);
+        assert_eq!(bytes_of_expr(&Expr::LitB(true)), vec![2, 1]);
+        assert_eq!(bytes_of_expr(&Expr::LitB(false)), vec![2, 0]);
+        assert_eq!(bytes_of_expr(&Expr::Ref("x")), vec![3, 1, 0, 0, 0, b'x']);
+        assert_eq!(
+            bytes_of_expr(&Expr::Binding("b")),
+            vec![4, 1, 0, 0, 0, b'b']
+        );
+    }
+
+    #[test]
+    fn expr_compound_forms_pin_exact_bytes() {
+        assert_eq!(
+            bytes_of_expr(&Expr::Call("tr", vec![Expr::LitS("k")])),
+            vec![5, 2, 0, 0, 0, b't', b'r', 1, 0, 0, 0, 0, 1, 0, 0, 0, b'k']
+        );
+        assert_eq!(
+            bytes_of_expr(&Expr::Call("str", vec![])),
+            vec![5, 3, 0, 0, 0, b's', b't', b'r', 0, 0, 0, 0]
+        );
+        assert_eq!(
+            bytes_of_expr(&Expr::Not(Box::new(Expr::LitB(true)))),
+            vec![7, 2, 1]
+        );
+        assert_eq!(
+            bytes_of_expr(&Expr::Neg(Box::new(Expr::LitF(1.0)))),
+            vec![8, 1, 0, 0, 0x80, 0x3F]
+        );
+        assert_eq!(
+            bytes_of_expr(&Expr::Cond(
+                Box::new(Expr::LitB(true)),
+                Box::new(Expr::LitS("a")),
+                Box::new(Expr::LitS(""))
+            )),
+            vec![9, 2, 1, 0, 1, 0, 0, 0, b'a', 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            bytes_of_expr(&Expr::Field(Box::new(Expr::Ref("x")), "id")),
+            vec![10, 3, 1, 0, 0, 0, b'x', 2, 0, 0, 0, b'i', b'd']
+        );
+    }
+
+    #[test]
+    fn expr_bin_op_tags_are_pinned() {
+        let cases: &[(BinOp, u8)] = &[
+            (BinOp::Add, 0),
+            (BinOp::Sub, 1),
+            (BinOp::Mul, 2),
+            (BinOp::Div, 3),
+            (BinOp::Eq, 4),
+            (BinOp::Ne, 5),
+            (BinOp::Lt, 6),
+            (BinOp::Le, 7),
+            (BinOp::Gt, 8),
+            (BinOp::Ge, 9),
+            (BinOp::And, 10),
+            (BinOp::Or, 11),
+            (BinOp::Mod, 12),
+        ];
+        for (op, tag) in cases {
+            assert_eq!(
+                bytes_of_expr(&Expr::Bin(
+                    *op,
+                    Box::new(Expr::LitF(1.0)),
+                    Box::new(Expr::LitF(2.0))
+                )),
+                vec![6, *tag, 1, 0, 0, 0x80, 0x3F, 1, 0, 0, 0, 0x40],
+                "BinOp {op:?} 的标签必须是 {tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn classtok_and_optional_fields_pin_exact_bytes() {
+        assert_eq!(bytes_of_tok(&ClassTok::Lit("a")), vec![0, 1, 0, 0, 0, b'a']);
+        assert_eq!(
+            bytes_of_tok(&ClassTok::If {
+                cond: Expr::LitB(true),
+                tok: "t",
+            }),
+            vec![1, 2, 1, 1, 0, 0, 0, b't']
+        );
+        assert_eq!(
+            bytes_of_tok(&ClassTok::Dyn(Expr::Ref("x"))),
+            vec![2, 3, 1, 0, 0, 0, b'x']
+        );
+
+        let mut w = Writer::default();
+        opt_expr(&mut w, &None);
+        opt_expr(&mut w, &Some(Expr::LitB(false)));
+        opt_str(&mut w, None);
+        opt_str(&mut w, Some("x"));
+        assert_eq!(w.out, vec![0, 1, 2, 0, 0, 1, 1, 0, 0, 0, b'x']);
+    }
+
+    #[test]
+    fn node_el_tag_codes_and_empty_shape_are_pinned() {
+        for (tag, code) in [
+            (NodeTag::Text, 0u8),
+            (NodeTag::Image, 1),
+            (NodeTag::Box, 2),
+            (NodeTag::Control, 3),
+        ] {
+            let n = Node::El(ElementNode {
+                tag,
+                key: None,
+                classes: vec![],
+                attrs: vec![],
+                children: vec![],
+            });
+            assert_eq!(
+                bytes_of_node(&n),
+                vec![0, code, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                "NodeTag {tag:?} 的标签必须是 {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_el_with_key_classes_attrs_and_children() {
+        let n = Node::El(ElementNode {
+            tag: NodeTag::Box,
+            key: Some(Expr::LitS("k")),
+            classes: vec![ClassTok::Lit("a")],
+            attrs: vec![("x", Expr::LitB(true))],
+            children: vec![Node::Slot],
+        });
+        assert_eq!(
+            bytes_of_node(&n),
+            vec![
+                0, 2, // El, Box
+                1, 0, 1, 0, 0, 0, b'k', // opt key = LitS("k")
+                1, 0, 0, 0, 0, 1, 0, 0, 0, b'a', // 一个 classtok = Lit("a")
+                1, 0, 0, 0, 1, 0, 0, 0, b'x', 2, 1, // 一个属性 ("x", LitB(true))
+                1, 0, 0, 0, 4, // 一个子节点 = Slot
+            ]
+        );
+    }
+
+    #[test]
+    fn node_if_for_use_and_slot_pin_exact_bytes() {
+        let n = Node::If(IfNode {
+            cond: Expr::LitB(true),
+            then: vec![Node::Slot],
+            els: vec![],
+        });
+        assert_eq!(bytes_of_node(&n), vec![1, 2, 1, 1, 0, 0, 0, 4, 0, 0, 0, 0]);
+
+        let n = Node::For(ForNode {
+            var: "i",
+            index: Some("ix"),
+            track_key: Some(Expr::Ref("k")),
+            list: Expr::Binding("items"),
+            body: vec![Node::Slot],
+        });
+        assert_eq!(
+            bytes_of_node(&n),
+            vec![
+                2, 1, 0, 0, 0, b'i', // var
+                1, 2, 0, 0, 0, b'i', b'x', // opt index
+                1, 3, 1, 0, 0, 0, b'k', // opt track_key = Ref("k")
+                4, 5, 0, 0, 0, b'i', b't', b'e', b'm', b's', // list = Binding("items")
+                1, 0, 0, 0, 4, // body: 一个 Slot
+            ]
+        );
+
+        let n = Node::Use(UseNode {
+            comp: "C",
+            key: None,
+            class_extra: vec![],
+            args: vec![],
+            children: vec![],
+        });
+        assert_eq!(
+            bytes_of_node(&n),
+            vec![3, 1, 0, 0, 0, b'C', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(bytes_of_node(&Node::Slot), vec![4]);
+    }
+
+    #[test]
+    fn encode_empty_artifact_pins_magic_and_counts() {
+        let raw = RawUi {
+            components: vec![],
+            pages: vec![],
+        };
+        assert_eq!(
+            encode(&raw),
+            vec![b'Z', b'Y', b'P', b'1', 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn encode_one_component_and_one_page_pins_full_layout() {
+        let raw = RawUi {
+            components: vec![Component {
+                name: "C",
+                params: vec!["a"],
+                body: vec![],
+            }],
+            pages: vec![Page {
+                name: "p",
+                root: vec![Node::Slot],
+            }],
+        };
+        assert_eq!(
+            encode(&raw),
+            vec![
+                b'Z', b'Y', b'P', b'1', // MAGIC
+                1, 0, 0, 0, // 一个组件
+                1, 0, 0, 0, b'C', // 组件名
+                1, 0, 0, 0, 1, 0, 0, 0, b'a', // 一个参数 "a"
+                0, 0, 0, 0, // 空模板体
+                1, 0, 0, 0, // 一个页面
+                1, 0, 0, 0, b'p', // 页名
+                1, 0, 0, 0, 4, // 一个根节点 = Slot
+            ]
+        );
+    }
+}

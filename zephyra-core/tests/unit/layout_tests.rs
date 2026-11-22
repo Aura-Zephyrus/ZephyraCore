@@ -1648,3 +1648,94 @@ fn pick_axis_adds_padding_to_content_and_keeps_it_when_max_is_unbounded() {
         "内容 20×6 + 四边内边距 7 ⇒ 34×20"
     );
 }
+
+// ============================== scroll_child_constraints ==============================
+
+use crate::layout::scroll_child_constraints;
+
+/// 横向滚动：主轴（宽）无界，交叉轴（高）按视口收紧。下限在主轴上归零，
+/// 交叉轴沿用父给的下限。
+#[test]
+fn scroll_constraints_horizontal_unbounds_width_and_caps_height_by_viewport() {
+    let c = scroll_child_constraints(
+        Direction::Horizontal,
+        Constraints {
+            min: Size::new(10.0, 20.0),
+            max: Size::new(800.0, 600.0),
+        },
+        Size::new(300.0, 120.0),
+    );
+    assert_eq!((c.min.width, c.min.height), (0.0, 20.0));
+    assert_eq!(c.max.width, f32::INFINITY);
+    assert_eq!(c.max.height, 120.0);
+}
+
+/// 纵向滚动：主轴（高）无界，交叉轴（宽）按视口收紧，下限在主轴上归零。
+#[test]
+fn scroll_constraints_vertical_unbounds_height_and_caps_width_by_viewport() {
+    let c = scroll_child_constraints(
+        Direction::Vertical,
+        Constraints {
+            min: Size::new(10.0, 20.0),
+            max: Size::new(800.0, 600.0),
+        },
+        Size::new(300.0, 120.0),
+    );
+    assert_eq!((c.min.width, c.min.height), (10.0, 0.0));
+    assert_eq!(c.max.width, 300.0);
+    assert_eq!(c.max.height, f32::INFINITY);
+}
+
+/// 视口比父上限还大时取父上限（`min` 的方向不能写反），两个方向都要覆盖。
+#[test]
+fn scroll_constraints_keep_smaller_cross_upper_bound() {
+    let h = scroll_child_constraints(
+        Direction::Horizontal,
+        Constraints {
+            min: Size::new(7.0, 9.0),
+            max: Size::new(1000.0, 90.0),
+        },
+        Size::new(2000.0, 400.0),
+    );
+    assert_eq!((h.min.width, h.min.height), (0.0, 9.0));
+    assert_eq!((h.max.width, h.max.height), (f32::INFINITY, 90.0));
+
+    let v = scroll_child_constraints(
+        Direction::Vertical,
+        Constraints {
+            min: Size::new(7.0, 9.0),
+            max: Size::new(250.0, 1000.0),
+        },
+        Size::new(400.0, 2000.0),
+    );
+    assert_eq!((v.min.width, v.min.height), (7.0, 0.0));
+    assert_eq!((v.max.width, v.max.height), (250.0, f32::INFINITY));
+}
+
+/// 父上限无界时交叉轴取有限视口值；视口为 0 时收紧到 0，不能变成无界。
+#[test]
+fn scroll_constraints_handle_unbounded_parent_and_zero_viewport() {
+    let h = scroll_child_constraints(
+        Direction::Horizontal,
+        Constraints::unbounded(),
+        Size::new(300.0, 50.0),
+    );
+    assert_eq!((h.min.width, h.min.height), (0.0, 0.0));
+    assert_eq!((h.max.width, h.max.height), (f32::INFINITY, 50.0));
+
+    let v = scroll_child_constraints(
+        Direction::Vertical,
+        Constraints::unbounded(),
+        Size::new(80.0, 900.0),
+    );
+    assert_eq!((v.min.width, v.min.height), (0.0, 0.0));
+    assert_eq!((v.max.width, v.max.height), (80.0, f32::INFINITY));
+
+    let zero = scroll_child_constraints(
+        Direction::Horizontal,
+        Constraints::unbounded(),
+        Size::new(0.0, 0.0),
+    );
+    assert_eq!((zero.min.width, zero.min.height), (0.0, 0.0));
+    assert_eq!((zero.max.width, zero.max.height), (f32::INFINITY, 0.0));
+}

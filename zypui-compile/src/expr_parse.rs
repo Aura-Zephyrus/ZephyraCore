@@ -357,3 +357,339 @@ fn char_at(s: &str, i: usize) -> String {
         .map(|c| c.to_string())
         .unwrap_or_default()
 }
+
+// ============================== 直接单测（解析器各层） ==============================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 与 `parse_expr` 同样的起点（第 1 行第 1 列），但直接拿到私有 parser 调各层。
+    fn parser(s: &str) -> ExprParser<'_> {
+        ExprParser {
+            s,
+            file: "t.zypui",
+            line: 1,
+            col: 1,
+            i: 0,
+        }
+    }
+
+    fn e1(v: f32) -> Box<Expr> {
+        Box::new(Expr::LitF(v))
+    }
+
+    #[test]
+    fn parse_expr_pins_literals_references_and_bindings() {
+        assert_eq!(parse_expr("42", "t.zypui", 1, 1), Ok(Expr::LitF(42.0)));
+        assert_eq!(parse_expr("3.5", "t.zypui", 1, 1), Ok(Expr::LitF(3.5)));
+        assert_eq!(parse_expr("true", "t.zypui", 1, 1), Ok(Expr::LitB(true)));
+        assert_eq!(parse_expr("false", "t.zypui", 1, 1), Ok(Expr::LitB(false)));
+        assert_eq!(parse_expr("name", "t.zypui", 1, 1), Ok(Expr::Ref("name")));
+        assert_eq!(parse_expr("@n", "t.zypui", 1, 1), Ok(Expr::Binding("n")));
+        // 首尾空白被 trim 掉，结构不受影响。
+        assert_eq!(parse_expr("  42  ", "t.zypui", 1, 1), Ok(Expr::LitF(42.0)));
+    }
+
+    #[test]
+    fn parse_expr_pins_precedence_and_unary() {
+        // 1 + 2 * 3
+        assert_eq!(
+            parse_expr("1 + 2 * 3", "t.zypui", 1, 1),
+            Ok(Expr::Bin(
+                BinOp::Add,
+                e1(1.0),
+                Box::new(Expr::Bin(BinOp::Mul, e1(2.0), e1(3.0)))
+            ))
+        );
+        // a && b || c
+        assert_eq!(
+            parse_expr("a && b || c", "t.zypui", 1, 1),
+            Ok(Expr::Bin(
+                BinOp::Or,
+                Box::new(Expr::Bin(
+                    BinOp::And,
+                    Box::new(Expr::Ref("a")),
+                    Box::new(Expr::Ref("b"))
+                )),
+                Box::new(Expr::Ref("c"))
+            ))
+        );
+        assert_eq!(
+            parse_expr("!flag", "t.zypui", 1, 1),
+            Ok(Expr::Not(Box::new(Expr::Ref("flag"))))
+        );
+        assert_eq!(parse_expr("-1", "t.zypui", 1, 1), Ok(Expr::Neg(e1(1.0))));
+        assert_eq!(
+            parse_expr("!!x", "t.zypui", 1, 1),
+            Ok(Expr::Not(Box::new(Expr::Not(Box::new(Expr::Ref("x"))))))
+        );
+    }
+
+    #[test]
+    fn parse_expr_pins_all_comparison_ops() {
+        for (src, op) in [
+            ("1 == 2", BinOp::Eq),
+            ("1 != 2", BinOp::Ne),
+            ("1 < 2", BinOp::Lt),
+            ("1 <= 2", BinOp::Le),
+            ("1 > 2", BinOp::Gt),
+            ("1 >= 2", BinOp::Ge),
+            ("1 + 2", BinOp::Add),
+            ("1 - 2", BinOp::Sub),
+            ("1 * 2", BinOp::Mul),
+            ("1 / 2", BinOp::Div),
+            ("1 % 2", BinOp::Mod),
+        ] {
+            assert_eq!(
+                parse_expr(src, "t.zypui", 1, 1),
+                Ok(Expr::Bin(op, e1(1.0), e1(2.0))),
+                "表达式 {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_expr_pins_calls_fields_parentheses_and_ternary() {
+        assert_eq!(
+            parse_expr("tr('k')", "t.zypui", 1, 1),
+            Ok(Expr::Call("tr", vec![Expr::LitS("k")]))
+        );
+        assert_eq!(
+            parse_expr("item.id.name", "t.zypui", 1, 1),
+            Ok(Expr::Field(
+                Box::new(Expr::Field(Box::new(Expr::Ref("item")), "id")),
+                "name"
+            ))
+        );
+        assert_eq!(
+            parse_expr("(1 + 2)", "t.zypui", 1, 1),
+            Ok(Expr::Bin(BinOp::Add, e1(1.0), e1(2.0)))
+        );
+        assert_eq!(
+            parse_expr("a ? b : c", "t.zypui", 1, 1),
+            Ok(Expr::Cond(
+                Box::new(Expr::Ref("a")),
+                Box::new(Expr::Ref("b")),
+                Box::new(Expr::Ref("c"))
+            ))
+        );
+        // 单臂：else 降级为空串。
+        assert_eq!(
+            parse_expr("hover ? 'hovered'", "t.zypui", 1, 1),
+            Ok(Expr::Cond(
+                Box::new(Expr::Ref("hover")),
+                Box::new(Expr::LitS("hovered")),
+                Box::new(Expr::LitS(""))
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_expr_errors_pin_exact_diagnostics() {
+        assert_eq!(
+            parse_expr("", "t.zypui", 1, 1),
+            Err(Diag::error("t.zypui", 1, 1, "表达式提前结束"))
+        );
+        assert_eq!(
+            parse_expr("@", "t.zypui", 1, 1),
+            Err(Diag::error("t.zypui", 1, 2, "`@` 后面要跟绑定名"))
+        );
+        assert_eq!(
+            parse_expr("1 +", "t.zypui", 1, 1),
+            Err(Diag::error("t.zypui", 1, 4, "表达式提前结束"))
+        );
+        assert_eq!(
+            parse_expr("a b", "t.zypui", 1, 1),
+            Err(Diag::error("t.zypui", 1, 3, "表达式后有多余内容 `b`"))
+        );
+        assert_eq!(
+            parse_expr("#", "t.zypui", 5, 10),
+            Err(Diag::error("t.zypui", 5, 10, "意外字符 `#`"))
+        );
+        assert_eq!(
+            parse_expr("(1", "t.zypui", 1, 1),
+            Err(Diag::error("t.zypui", 1, 3, "缺闭合括号 `)`"))
+        );
+        // 调用者给的起点列必须进入诊断。
+        assert_eq!(
+            parse_expr("@", "t.zypui", 9, 7),
+            Err(Diag::error("t.zypui", 9, 8, "`@` 后面要跟绑定名"))
+        );
+    }
+
+    #[test]
+    fn parser_primary_constructs_each_form() {
+        assert_eq!(parser("42").primary(), Ok(Expr::LitF(42.0)));
+        assert_eq!(parser("3.5").primary(), Ok(Expr::LitF(3.5)));
+        assert_eq!(parser("true").primary(), Ok(Expr::LitB(true)));
+        assert_eq!(parser("false").primary(), Ok(Expr::LitB(false)));
+        assert_eq!(parser("foo").primary(), Ok(Expr::Ref("foo")));
+        assert_eq!(parser("@foo").primary(), Ok(Expr::Binding("foo")));
+        assert_eq!(
+            parser("tr('k')").primary(),
+            Ok(Expr::Call("tr", vec![Expr::LitS("k")]))
+        );
+        assert_eq!(
+            parser("f(1,2)").primary(),
+            Ok(Expr::Call("f", vec![Expr::LitF(1.0), Expr::LitF(2.0)]))
+        );
+        assert_eq!(parser("f()").primary(), Ok(Expr::Call("f", vec![])));
+        assert_eq!(
+            parser("(1 + 2)").primary(),
+            Ok(Expr::Bin(BinOp::Add, e1(1.0), e1(2.0)))
+        );
+    }
+
+    #[test]
+    fn parser_primary_errors_are_pinned() {
+        assert_eq!(
+            parser("").primary(),
+            Err(Diag::error("t.zypui", 1, 1, "表达式提前结束"))
+        );
+        assert_eq!(
+            parser("#").primary(),
+            Err(Diag::error("t.zypui", 1, 1, "意外字符 `#`"))
+        );
+        assert_eq!(
+            parser(".5").primary(),
+            Err(Diag::error("t.zypui", 1, 1, "意外字符 `.`"))
+        );
+        assert_eq!(
+            parser("@").primary(),
+            Err(Diag::error("t.zypui", 1, 2, "`@` 后面要跟绑定名"))
+        );
+        assert_eq!(
+            parser("(1").primary(),
+            Err(Diag::error("t.zypui", 1, 3, "缺闭合括号 `)`"))
+        );
+        assert_eq!(
+            parser("f(1,)").primary(),
+            Err(Diag::error("t.zypui", 1, 5, "意外字符 `)`"))
+        );
+    }
+
+    #[test]
+    fn parser_postfix_records_field_chains() {
+        assert_eq!(parser("x").postfix(), Ok(Expr::Ref("x")));
+        assert_eq!(
+            parser("item.id").postfix(),
+            Ok(Expr::Field(Box::new(Expr::Ref("item")), "id"))
+        );
+        assert_eq!(
+            parser("item.id.name").postfix(),
+            Ok(Expr::Field(
+                Box::new(Expr::Field(Box::new(Expr::Ref("item")), "id")),
+                "name"
+            ))
+        );
+        // 点号前允许空白；点号后必须紧跟字段名。
+        assert_eq!(
+            parser("item .id").postfix(),
+            Ok(Expr::Field(Box::new(Expr::Ref("item")), "id"))
+        );
+        // 悬空的点不被消费，留给 parse_expr 的「多余内容」报错。
+        let mut p = parser("item.");
+        assert_eq!(p.postfix(), Ok(Expr::Ref("item")));
+        assert_eq!(p.i, 4);
+        assert_eq!(
+            parse_expr("item.", "t.zypui", 1, 1),
+            Err(Diag::error("t.zypui", 1, 5, "表达式后有多余内容 `.`"))
+        );
+    }
+
+    #[test]
+    fn parser_ternary_full_single_arm_and_right_assoc() {
+        assert_eq!(
+            parser("a ? b : c").ternary(),
+            Ok(Expr::Cond(
+                Box::new(Expr::Ref("a")),
+                Box::new(Expr::Ref("b")),
+                Box::new(Expr::Ref("c"))
+            ))
+        );
+        assert_eq!(
+            parser("hover ? 'hovered'").ternary(),
+            Ok(Expr::Cond(
+                Box::new(Expr::Ref("hover")),
+                Box::new(Expr::LitS("hovered")),
+                Box::new(Expr::LitS(""))
+            ))
+        );
+        // 右结合：a ? b : (c ? d : e)
+        assert_eq!(
+            parser("a ? b : c ? d : e").ternary(),
+            Ok(Expr::Cond(
+                Box::new(Expr::Ref("a")),
+                Box::new(Expr::Ref("b")),
+                Box::new(Expr::Cond(
+                    Box::new(Expr::Ref("c")),
+                    Box::new(Expr::Ref("d")),
+                    Box::new(Expr::Ref("e"))
+                ))
+            ))
+        );
+        // 真臂也是三元：a ? (b ? c : d) : e
+        assert_eq!(
+            parser("a ? b ? c : d : e").ternary(),
+            Ok(Expr::Cond(
+                Box::new(Expr::Ref("a")),
+                Box::new(Expr::Cond(
+                    Box::new(Expr::Ref("b")),
+                    Box::new(Expr::Ref("c")),
+                    Box::new(Expr::Ref("d"))
+                )),
+                Box::new(Expr::Ref("e"))
+            ))
+        );
+    }
+
+    #[test]
+    fn parser_string_lit_decodes_every_escape() {
+        assert_eq!(
+            parser(r#"'a\nb'"#).string_lit(b'\''),
+            Ok(Expr::LitS("a\nb"))
+        );
+        assert_eq!(
+            parser(r#"'a\tb'"#).string_lit(b'\''),
+            Ok(Expr::LitS("a\tb"))
+        );
+        assert_eq!(
+            parser(r#"'a\\b'"#).string_lit(b'\''),
+            Ok(Expr::LitS("a\\b"))
+        );
+        assert_eq!(parser(r#"'a\'b'"#).string_lit(b'\''), Ok(Expr::LitS("a'b")));
+        assert_eq!(parser(r#""a\"b""#).string_lit(b'"'), Ok(Expr::LitS("a\"b")));
+        assert_eq!(parser("''").string_lit(b'\''), Ok(Expr::LitS("")));
+        // 多字节 UTF-8 按整字符收。
+        assert_eq!(parser("'世界'").string_lit(b'\''), Ok(Expr::LitS("世界")));
+    }
+
+    #[test]
+    fn parser_string_lit_errors_are_pinned() {
+        assert_eq!(
+            parser("'abc").string_lit(b'\''),
+            Err(Diag::error("t.zypui", 1, 5, "字符串没有闭合引号"))
+        );
+        assert_eq!(
+            parser(r#"'a\q'"#).string_lit(b'\''),
+            Err(Diag::error("t.zypui", 1, 5, "不认识的转义 `\\q`"))
+        );
+        assert_eq!(
+            parser(r#"'a\"#).string_lit(b'\''),
+            Err(Diag::error("t.zypui", 1, 4, "转义符后面没有字符"))
+        );
+    }
+
+    #[test]
+    fn leak_and_char_at_edge_cases() {
+        let s: &'static str = leak("abc");
+        assert_eq!(s, "abc");
+        assert_eq!(char_at("abc", 0), "a");
+        assert_eq!(char_at("abc", 2), "c");
+        assert_eq!(char_at("世界", 0), "世");
+        assert_eq!(char_at("世界", 3), "界");
+        assert_eq!(char_at("abc", 3), "");
+        assert_eq!(char_at("", 0), "");
+    }
+}

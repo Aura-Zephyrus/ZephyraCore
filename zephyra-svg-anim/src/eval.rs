@@ -1104,3 +1104,604 @@ pub fn to_dynamic_path(frame: &RenderedPath) -> Option<DynamicPath> {
     }
     Some(DynamicPath::new(mesh.vertices.to_vec()))
 }
+
+// ========================================================================
+// 内联单元测试：时间线与插值的纯函数分支（边界 / 重复 / 缺属性）
+// ========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zephyra_bezier::Bezier;
+
+    fn base_timing() -> Timing {
+        Timing {
+            dur_ms: Some(1000.0),
+            ..Timing::default()
+        }
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn phase_before_begin_returns_none() {
+        let t = Timing {
+            begin: Begin::Offset(500.0),
+            ..base_timing()
+        };
+        assert_eq!(phase(&t, 100.0), None);
+        assert_eq!(phase(&t, 499.0), None);
+    }
+
+    #[test]
+    fn phase_backwards_holds_first_value_during_delay() {
+        let t = Timing {
+            begin: Begin::Offset(500.0),
+            backwards: true,
+            ..base_timing()
+        };
+        assert_eq!(phase(&t, 100.0), Some((0.0, false, 0)));
+        let reverse = Timing {
+            direction: Direction::Reverse,
+            ..t
+        };
+        assert_eq!(phase(&reverse, 100.0), Some((1.0, false, 0)));
+    }
+
+    #[test]
+    fn phase_at_zero_and_inside_first_iteration() {
+        let t = base_timing();
+        assert_eq!(phase(&t, 0.0), Some((0.0, true, 0)));
+        assert_eq!(phase(&t, 500.0), Some((0.5, true, 0)));
+        assert_eq!(phase(&t, 999.0), Some((0.999, true, 0)));
+    }
+
+    #[test]
+    fn phase_duration_boundary_freezes_or_removes() {
+        let mut t = base_timing();
+        t.fill = FillMode::Freeze;
+        assert_eq!(phase(&t, 1000.0), Some((1.0, false, 0)));
+        assert_eq!(phase(&t, 5000.0), Some((1.0, false, 0)));
+        t.fill = FillMode::Remove;
+        assert_eq!(phase(&t, 1000.0), None);
+    }
+
+    #[test]
+    fn phase_repeat_count_and_indefinite_wrap() {
+        let mut t = base_timing();
+        t.repeat = Repeat::Count(2);
+        assert_eq!(phase(&t, 1500.0), Some((0.5, true, 1)));
+        assert_eq!(phase(&t, 2000.0), None);
+        t.repeat = Repeat::Indefinite;
+        assert_eq!(phase(&t, 1000.0), Some((0.0, true, 1)));
+        assert_eq!(phase(&t, 2500.0), Some((0.5, true, 2)));
+    }
+
+    #[test]
+    fn phase_end_freezes_at_actual_progress() {
+        let mut t = base_timing();
+        t.fill = FillMode::Freeze;
+        t.end_ms = Some(400.0);
+        assert_eq!(phase(&t, 400.0), Some((0.4, false, 0)));
+        assert_eq!(phase(&t, 500.0), Some((0.4, false, 0)));
+    }
+
+    #[test]
+    fn phase_end_remove_returns_none() {
+        let t = Timing {
+            end_ms: Some(400.0),
+            ..base_timing()
+        };
+        assert_eq!(phase(&t, 500.0), None);
+    }
+
+    #[test]
+    fn phase_end_after_multiple_repeats_keeps_fraction() {
+        let t = Timing {
+            repeat: Repeat::Indefinite,
+            fill: FillMode::Freeze,
+            end_ms: Some(2500.0),
+            ..base_timing()
+        };
+        assert_eq!(phase(&t, 3000.0), Some((0.5, false, 2)));
+    }
+
+    #[test]
+    fn phase_end_before_begin_clamps_to_zero() {
+        let t = Timing {
+            begin: Begin::Offset(500.0),
+            fill: FillMode::Freeze,
+            end_ms: Some(200.0),
+            ..base_timing()
+        };
+        // time < begin 时先走「尚未开始」分支，end 判定不可达；取 time >= begin 才能命中。
+        assert_eq!(phase(&t, 600.0), Some((0.0, false, 0)));
+    }
+
+    #[test]
+    fn phase_min_holds_terminal_value_until_elapsed() {
+        let t = Timing {
+            dur_ms: Some(200.0),
+            min_ms: 800.0,
+            ..base_timing()
+        };
+        assert_eq!(phase(&t, 400.0), Some((1.0, false, 0)));
+        assert_eq!(phase(&t, 900.0), None);
+    }
+
+    #[test]
+    fn phase_max_caps_at_actual_progress() {
+        let mut t = Timing {
+            dur_ms: Some(5000.0),
+            max_ms: Some(1000.0),
+            fill: FillMode::Freeze,
+            ..base_timing()
+        };
+        assert_eq!(phase(&t, 2000.0), Some((0.2, false, 0)));
+        // max 分支只在「还未播完」时可达：Count(1) 会先命中 done。
+        t.repeat = Repeat::Indefinite;
+        t.dur_ms = Some(1000.0);
+        t.max_ms = Some(2500.0);
+        assert_eq!(phase(&t, 3000.0), Some((0.5, false, 2)));
+        t.fill = FillMode::Remove;
+        assert_eq!(phase(&t, 3000.0), None);
+    }
+
+    #[test]
+    fn phase_repeat_zero_never_applies() {
+        let t = Timing {
+            repeat: Repeat::Count(0),
+            fill: FillMode::Freeze,
+            ..base_timing()
+        };
+        assert_eq!(phase(&t, 0.0), None);
+        assert_eq!(phase(&t, 500.0), None);
+    }
+
+    #[test]
+    fn phase_repeat_duration_and_bounded() {
+        let mut t = Timing {
+            repeat: Repeat::Duration(2500.0),
+            fill: FillMode::Freeze,
+            ..base_timing()
+        };
+        assert_eq!(phase(&t, 2600.0), Some((1.0, false, 0)));
+        t.repeat = Repeat::Bounded {
+            count: 5,
+            total_ms: 2500.0,
+        };
+        assert_eq!(phase(&t, 2600.0), Some((1.0, false, 0)));
+        assert_eq!(phase(&t, 5200.0), Some((1.0, false, 0)));
+    }
+
+    #[test]
+    fn phase_with_indefinite_duration_has_no_static_sample() {
+        let t = Timing {
+            dur_ms: None,
+            ..base_timing()
+        };
+        assert_eq!(phase(&t, 1000.0), None);
+    }
+
+    #[test]
+    fn directed_covers_all_four_modes() {
+        let mut t = base_timing();
+        assert_eq!(directed(0.3, &t, 0), 0.3);
+        t.direction = Direction::Reverse;
+        assert_eq!(directed(0.3, &t, 0), 0.7);
+        t.direction = Direction::Alternate;
+        assert_eq!(directed(0.3, &t, 0), 0.3);
+        assert_eq!(directed(0.3, &t, 1), 0.7);
+        assert_eq!(directed(0.3, &t, 2), 0.3);
+        t.direction = Direction::AlternateReverse;
+        assert_eq!(directed(0.3, &t, 0), 0.7);
+        assert_eq!(directed(0.3, &t, 1), 0.3);
+        assert_eq!(directed(0.3, &t, 2), 0.7);
+    }
+
+    #[test]
+    fn segment_at_equal_split_and_key_times() {
+        let t = base_timing();
+        assert_eq!(segment_at(&t, 0.9, 0), (0, 0.0));
+        assert_eq!(segment_at(&t, 0.9, 1), (0, 0.0));
+        assert_eq!(segment_at(&t, 0.0, 3), (0, 0.0));
+        assert_eq!(segment_at(&t, 0.25, 3), (0, 0.5));
+        assert_eq!(segment_at(&t, 0.75, 3), (1, 0.5));
+        assert_eq!(segment_at(&t, 1.0, 3), (1, 1.0));
+
+        let keyed = Timing {
+            key_times: vec![0.0, 0.25, 1.0],
+            ..base_timing()
+        };
+        assert_eq!(segment_at(&keyed, 0.125, 3), (0, 0.5));
+        assert_eq!(segment_at(&keyed, 0.25, 3), (0, 1.0));
+        assert_eq!(segment_at(&keyed, 0.625, 3), (1, 0.5));
+        assert_eq!(segment_at(&keyed, -0.1, 3), (0, 0.0));
+
+        let bad = Timing {
+            key_times: vec![0.0, 1.0],
+            ..base_timing()
+        };
+        assert_eq!(segment_at(&bad, 0.25, 3), (0, 0.5));
+    }
+
+    #[test]
+    fn eased_discrete_spline_and_missing_spline() {
+        let mut t = base_timing();
+        assert_eq!(eased(&t, 0, 0.4), 0.4);
+        t.calc_mode = CalcMode::Paced;
+        assert_eq!(eased(&t, 0, 0.4), 0.4);
+        t.calc_mode = CalcMode::Discrete;
+        assert_eq!(eased(&t, 2, 0.4), 0.0);
+        t.calc_mode = CalcMode::Spline;
+        t.key_splines = vec![Bezier::new(0.0, 0.0, 1.0, 1.0)];
+        assert!(close(eased(&t, 0, 0.4), 0.4));
+        assert_eq!(eased(&t, 1, 0.4), 0.4);
+    }
+
+    #[test]
+    fn mul_composes_affine_matrices() {
+        let tx = [1.0, 0.0, 0.0, 1.0, 10.0, 20.0];
+        assert_eq!(mul(IDENTITY, IDENTITY), IDENTITY);
+        assert_eq!(mul(IDENTITY, tx), tx);
+        assert_eq!(mul(tx, IDENTITY), tx);
+        let rot90 = [0.0, 1.0, -1.0, 0.0, 0.0, 0.0];
+        assert_eq!(mul(rot90, tx), [0.0, 1.0, -1.0, 0.0, -20.0, 10.0]);
+    }
+
+    #[test]
+    fn parse_hex_rgba_accepts_three_six_eight_digits() {
+        assert_eq!(parse_hex_rgba("#fff"), Some([1.0, 1.0, 1.0, 1.0]));
+        assert_eq!(parse_hex_rgba("#000000"), Some([0.0, 0.0, 0.0, 1.0]));
+        let c = parse_hex_rgba("#ff000080").unwrap();
+        assert!(close(c[0], 1.0) && close(c[1], 0.0) && close(c[3], 128.0 / 255.0));
+        assert_eq!(parse_hex_rgba("fff"), None);
+        assert_eq!(parse_hex_rgba("#12"), None);
+        assert_eq!(parse_hex_rgba("#gggggg"), None);
+    }
+
+    #[test]
+    fn effective_timing_overrides_begin_end_and_wallclock() {
+        let t = Timing {
+            begin: Begin::Indefinite,
+            end_ms: Some(900.0),
+            ..base_timing()
+        };
+        let e = effective_timing(&t, Some(200.0), Some(700.0), 0.0);
+        assert_eq!(e.begin, Begin::Offset(200.0));
+        assert_eq!(e.end_ms, Some(700.0));
+        assert_eq!(e.dur_ms, Some(1000.0));
+
+        let w = Timing {
+            begin: Begin::Wallclock {
+                time_ms: 12.0 * 3_600_000.0,
+            },
+            ..base_timing()
+        };
+        let e = effective_timing(&w, None, None, 11.5 * 3_600_000.0);
+        assert_eq!(e.begin, Begin::Offset(1_800_000.0));
+    }
+
+    #[test]
+    fn sample_f32_linear_by_discrete_and_empty() {
+        let t = base_timing();
+        assert_eq!(
+            sample_f32(&t, &Values::FromTo(0.0, 10.0), 0.0, 0.0),
+            Some((0.0, true))
+        );
+        assert_eq!(
+            sample_f32(&t, &Values::FromTo(0.0, 10.0), 500.0, 0.0),
+            Some((5.0, true))
+        );
+        assert_eq!(
+            sample_f32(&t, &Values::FromTo(0.0, 10.0), 1000.0, 0.0),
+            None
+        );
+        assert_eq!(
+            sample_f32(&t, &Values::By(5.0), 500.0, 2.0),
+            Some((4.5, true))
+        );
+        assert_eq!(sample_f32(&t, &Values::List(vec![]), 500.0, 0.0), None);
+
+        let discrete = Timing {
+            calc_mode: CalcMode::Discrete,
+            ..base_timing()
+        };
+        assert_eq!(
+            sample_f32(&discrete, &Values::FromTo(0.0, 10.0), 999.0, 0.0),
+            Some((0.0, true))
+        );
+    }
+
+    #[test]
+    fn sample_f32_accumulate_and_backwards() {
+        let mut t = Timing {
+            repeat: Repeat::Indefinite,
+            accumulate_sum: true,
+            ..base_timing()
+        };
+        assert_eq!(
+            sample_f32(&t, &Values::FromTo(0.0, 2.0), 1500.0, 0.0),
+            Some((3.0, true))
+        );
+        t.begin = Begin::Offset(500.0);
+        t.backwards = true;
+        t.accumulate_sum = false;
+        assert_eq!(
+            sample_f32(&t, &Values::FromTo(0.2, 0.8), 100.0, 0.0),
+            Some((0.2, false))
+        );
+    }
+
+    #[test]
+    fn sample_color_interpolation_by_discrete_and_accumulate() {
+        let t = base_timing();
+        let (c, active) = sample_color(
+            &t,
+            &Values::FromTo([1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
+            500.0,
+            [0.0; 4],
+        )
+        .unwrap();
+        assert!(close(c[0], 0.5) && close(c[2], 0.5) && close(c[3], 1.0) && active);
+
+        let (c, _) = sample_color(
+            &t,
+            &Values::By([0.2, 0.4, 0.0, 0.0]),
+            500.0,
+            [0.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        assert!(close(c[0], 0.1) && close(c[1], 0.2));
+
+        let discrete = Timing {
+            calc_mode: CalcMode::Discrete,
+            ..base_timing()
+        };
+        let (c, _) = sample_color(
+            &discrete,
+            &Values::FromTo([1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
+            999.0,
+            [0.0; 4],
+        )
+        .unwrap();
+        assert_eq!(c, [1.0, 0.0, 0.0, 1.0]);
+
+        let acc = Timing {
+            repeat: Repeat::Indefinite,
+            accumulate_sum: true,
+            ..base_timing()
+        };
+        let (c, _) = sample_color(
+            &acc,
+            &Values::FromTo([0.0, 0.0, 0.0, 1.0], [0.5, 0.0, 0.0, 1.0]),
+            1500.0,
+            [0.0; 4],
+        )
+        .unwrap();
+        assert!(close(c[0], 0.75));
+    }
+
+    #[test]
+    fn sample_f32x3_interpolation_by_and_discrete() {
+        let t = base_timing();
+        let (v, active) = sample_f32x3(
+            &t,
+            &Values::FromTo([0.0, 0.0, 0.0], [10.0, 20.0, 30.0]),
+            500.0,
+            [0.0; 3],
+        )
+        .unwrap();
+        assert_eq!(v, [5.0, 10.0, 15.0]);
+        assert!(active);
+        let (v, _) = sample_f32x3(&t, &Values::By([2.0, 4.0, 6.0]), 500.0, [0.0; 3]).unwrap();
+        assert_eq!(v, [1.0, 2.0, 3.0]);
+
+        let discrete = Timing {
+            calc_mode: CalcMode::Discrete,
+            ..base_timing()
+        };
+        let (v, _) = sample_f32x3(
+            &discrete,
+            &Values::FromTo([1.0, 2.0, 3.0], [9.0, 9.0, 9.0]),
+            999.0,
+            [0.0; 3],
+        )
+        .unwrap();
+        assert_eq!(v, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn sample_path_rejects_by_and_empty_and_interpolates_same_kind() {
+        let t = base_timing();
+        assert_eq!(sample_path(&t, &Values::By(vec![]), 500.0, &[]), None);
+        assert_eq!(sample_path(&t, &Values::List(vec![]), 500.0, &[]), None);
+        let a = vec![Segment::MoveTo(0.0, 0.0), Segment::LineTo(10.0, 0.0)];
+        let b = vec![Segment::MoveTo(0.0, 0.0), Segment::LineTo(10.0, 10.0)];
+        let (v, active) = sample_path(&t, &Values::FromTo(a.clone(), b), 500.0, &a).unwrap();
+        assert_eq!(
+            v,
+            vec![Segment::MoveTo(0.0, 0.0), Segment::LineTo(10.0, 5.0)]
+        );
+        assert!(active);
+    }
+
+    #[test]
+    fn morph_handles_same_kind_empty_and_mismatched_shapes() {
+        let a = [Segment::MoveTo(0.0, 0.0), Segment::LineTo(10.0, 0.0)];
+        let b = [Segment::MoveTo(0.0, 0.0), Segment::LineTo(10.0, 10.0)];
+        assert_eq!(
+            morph(&a, &b, 0.5, &[]),
+            vec![Segment::MoveTo(0.0, 0.0), Segment::LineTo(10.0, 5.0)]
+        );
+        assert_eq!(morph(&[], &[], 0.5, &[]), Vec::<Segment>::new());
+
+        let only = [Segment::MoveTo(1.0, 2.0)];
+        assert_eq!(morph(&[], &only, 0.2, &[]), Vec::<Segment>::new());
+        assert_eq!(morph(&[], &only, 0.8, &[]), vec![Segment::MoveTo(1.0, 2.0)]);
+
+        let sq_a = [
+            Segment::MoveTo(0.0, 0.0),
+            Segment::LineTo(10.0, 0.0),
+            Segment::LineTo(10.0, 10.0),
+            Segment::Close,
+        ];
+        let sq_b = [
+            Segment::MoveTo(20.0, 20.0),
+            Segment::LineTo(30.0, 20.0),
+            Segment::LineTo(30.0, 30.0),
+            Segment::LineTo(20.0, 30.0),
+            Segment::Close,
+        ];
+        let v = morph(&sq_a, &sq_b, 0.5, &[]);
+        assert!(v.len() >= 3);
+        assert!(matches!(v.first(), Some(Segment::MoveTo(..))));
+        assert!(matches!(v.last(), Some(Segment::Close)));
+    }
+
+    #[test]
+    fn lerp_segment_covers_every_variant() {
+        assert_eq!(
+            lerp_segment(
+                &Segment::MoveTo(0.0, 0.0),
+                &Segment::MoveTo(10.0, 20.0),
+                0.25
+            ),
+            Segment::MoveTo(2.5, 5.0)
+        );
+        assert_eq!(
+            lerp_segment(
+                &Segment::LineTo(0.0, 0.0),
+                &Segment::LineTo(10.0, 20.0),
+                0.5
+            ),
+            Segment::LineTo(5.0, 10.0)
+        );
+        assert_eq!(
+            lerp_segment(
+                &Segment::CubicTo(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                &Segment::CubicTo(10.0, 20.0, 30.0, 40.0, 50.0, 60.0),
+                0.5
+            ),
+            Segment::CubicTo(5.0, 10.0, 15.0, 20.0, 25.0, 30.0)
+        );
+        assert_eq!(
+            lerp_segment(
+                &Segment::QuadraticTo(0.0, 0.0, 0.0, 0.0),
+                &Segment::QuadraticTo(10.0, 20.0, 30.0, 40.0),
+                0.5
+            ),
+            Segment::QuadraticTo(5.0, 10.0, 15.0, 20.0)
+        );
+        assert_eq!(
+            lerp_segment(&Segment::Close, &Segment::Close, 0.5),
+            Segment::Close
+        );
+        assert_eq!(
+            lerp_segment(&Segment::MoveTo(1.0, 2.0), &Segment::LineTo(3.0, 4.0), 0.9),
+            Segment::MoveTo(1.0, 2.0)
+        );
+    }
+
+    #[test]
+    fn resample_empty_single_and_multi_point() {
+        assert_eq!(resample(&[], 3), vec![(0.0, 0.0); 3]);
+        assert_eq!(resample(&[(1.0, 2.0)], 2), vec![(1.0, 2.0), (1.0, 2.0)]);
+        assert_eq!(
+            resample(&[(0.0, 0.0), (10.0, 10.0)], 3),
+            vec![(0.0, 0.0), (5.0, 5.0), (10.0, 10.0)]
+        );
+    }
+
+    #[test]
+    fn sample_segments_covers_all_variants() {
+        let pts = sample_segments(&[Segment::MoveTo(0.0, 0.0), Segment::LineTo(10.0, 0.0)], 4);
+        assert_eq!(pts, vec![(0.0, 0.0), (10.0, 0.0)]);
+
+        let pts = sample_segments(
+            &[
+                Segment::MoveTo(0.0, 0.0),
+                Segment::QuadraticTo(0.0, 10.0, 10.0, 0.0),
+            ],
+            2,
+        );
+        assert_eq!(pts.len(), 3);
+        assert_eq!(pts[0], (0.0, 0.0));
+        assert_eq!(pts[2], (10.0, 0.0));
+        assert!(close(pts[1].1, 5.0));
+
+        let pts = sample_segments(
+            &[
+                Segment::MoveTo(0.0, 0.0),
+                Segment::CubicTo(0.0, 0.0, 10.0, 10.0, 10.0, 0.0),
+            ],
+            2,
+        );
+        assert_eq!(pts.len(), 3);
+        assert_eq!(pts[2], (10.0, 0.0));
+
+        let pts = sample_segments(&[Segment::MoveTo(1.0, 1.0), Segment::Close], 4);
+        assert_eq!(pts, vec![(1.0, 1.0)]);
+    }
+
+    #[test]
+    fn arc_length_at_uniform_nonuniform_and_degenerate() {
+        let line = [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0)];
+        assert_eq!(arc_length_at(&line, 0.0), 0.0);
+        assert_eq!(arc_length_at(&line, 0.5), 1.5);
+        assert_eq!(arc_length_at(&line, 1.0), 3.0);
+        let uneven = [(0.0, 0.0), (1.0, 0.0), (11.0, 0.0)];
+        assert!(close(arc_length_at(&uneven, 1.0 / 11.0), 1.0));
+        let same = [(1.0, 1.0), (1.0, 1.0), (1.0, 1.0)];
+        assert_eq!(arc_length_at(&same, 0.5), 1.0);
+    }
+
+    fn motion_anim(path: Vec<Segment>) -> MotionAnim {
+        MotionAnim {
+            timing: base_timing(),
+            path,
+            rotate_mode: MotionRotate::None,
+            key_points: vec![],
+            mpath_href: None,
+            origin: (0.0, 0.0),
+        }
+    }
+
+    #[test]
+    fn sample_motion_linear_paced_and_key_points() {
+        let path = vec![Segment::MoveTo(0.0, 0.0), Segment::LineTo(10.0, 0.0)];
+        let mut a = motion_anim(path);
+        let (p, angle, active) = sample_motion(&a, 500.0).unwrap();
+        assert_eq!(p, (5.0, 0.0));
+        assert!(close(angle, 0.0) && active);
+
+        a.origin = (5.0, 7.0);
+        assert_eq!(sample_motion(&a, 500.0).unwrap().0, (10.0, 7.0));
+        a.timing.calc_mode = CalcMode::Paced;
+        // 路径点 2.5 + origin.x 5。
+        assert_eq!(sample_motion(&a, 250.0).unwrap().0, (7.5, 7.0));
+
+        a.timing.calc_mode = CalcMode::Linear;
+        a.key_points = vec![0.0, 0.5];
+        assert_eq!(sample_motion(&a, 500.0).unwrap().0, (7.5, 7.0));
+        // keyPoints 越界 ⇒ s 被夹到末点（10 + origin.x 5）。
+        a.key_points = vec![0.0, 3.0];
+        assert_eq!(sample_motion(&a, 500.0).unwrap().0, (15.0, 7.0));
+    }
+
+    #[test]
+    fn sample_motion_angle_empty_path_and_before_begin() {
+        let mut a = motion_anim(vec![Segment::MoveTo(0.0, 0.0), Segment::LineTo(0.0, 10.0)]);
+        assert!(close(
+            sample_motion(&a, 500.0).unwrap().1,
+            std::f32::consts::FRAC_PI_2
+        ));
+
+        a.path.clear();
+        assert_eq!(sample_motion(&a, 500.0), Some(((0.0, 0.0), 0.0, true)));
+        a.timing.begin = Begin::Offset(1000.0);
+        assert_eq!(sample_motion(&a, 500.0), None);
+    }
+}

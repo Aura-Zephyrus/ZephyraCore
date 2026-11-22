@@ -60,3 +60,89 @@ pub use types::{
     MotionAnim, OpacityAnim, PathAnim, RenderedPath, Repeat, SvgAnimError, SvgFrame, Timing,
     TransformAnim, TransformKind, Values,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zephyra_vector::icon::{FillRule, PaintMode};
+
+    fn empty_svg() -> AnimatedSvg {
+        AnimatedSvg {
+            view_box: (0.0, 0.0, 10.0, 10.0),
+            paths: Vec::new(),
+        }
+    }
+
+    fn svg_with(timing: Timing, repeat: Repeat) -> AnimatedSvg {
+        AnimatedSvg {
+            view_box: (0.0, 0.0, 10.0, 10.0),
+            paths: vec![AnimatedPath {
+                base: Vec::new(),
+                paint_mode: PaintMode::CurrentColor,
+                fill_rule: FillRule::NonZero,
+                animations: vec![Animation::Opacity(OpacityAnim {
+                    timing: Timing { repeat, ..timing },
+                    values: Values::FromTo(0.0, 1.0),
+                })],
+            }],
+        }
+    }
+
+    #[test]
+    fn duration_of_empty_svg_is_at_least_one() {
+        assert_eq!(duration_ms(&empty_svg()), 1.0);
+    }
+
+    #[test]
+    fn duration_adds_positive_offset_begin_to_single_run() {
+        let t = Timing {
+            begin: Begin::Offset(500.0),
+            dur_ms: Some(1000.0),
+            ..Timing::default()
+        };
+        assert_eq!(duration_ms(&svg_with(t, Repeat::Count(1))), 1500.0);
+    }
+
+    #[test]
+    fn duration_uses_repeat_strategy() {
+        let t = Timing {
+            dur_ms: Some(1000.0),
+            ..Timing::default()
+        };
+        assert_eq!(duration_ms(&svg_with(t.clone(), Repeat::Count(3))), 3000.0);
+        assert_eq!(
+            duration_ms(&svg_with(t.clone(), Repeat::Duration(2500.0))),
+            2500.0
+        );
+        assert_eq!(
+            duration_ms(&svg_with(t.clone(), Repeat::Indefinite)),
+            1000.0
+        );
+        assert_eq!(
+            duration_ms(&svg_with(
+                t,
+                Repeat::Bounded {
+                    count: 5,
+                    total_ms: 2500.0
+                }
+            )),
+            1000.0
+        );
+    }
+
+    #[test]
+    fn duration_ignores_negative_and_non_offset_begins() {
+        let t = Timing {
+            begin: Begin::Offset(-500.0),
+            dur_ms: Some(1000.0),
+            ..Timing::default()
+        };
+        assert_eq!(duration_ms(&svg_with(t, Repeat::Count(1))), 1000.0);
+        let t = Timing {
+            begin: Begin::Indefinite,
+            dur_ms: Some(1000.0),
+            ..Timing::default()
+        };
+        assert_eq!(duration_ms(&svg_with(t, Repeat::Count(1))), 1000.0);
+    }
+}

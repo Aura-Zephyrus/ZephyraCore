@@ -1139,3 +1139,339 @@ fn parse_hex_color(hex: &str) -> Option<Color> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cssparser::{Parser, ParserInput};
+    use zephyra_core::core::{CornerShape, Point};
+    use zephyra_core::filter::{Filter, Material};
+    use zephyra_core::layout::{
+        AlignContent, AlignItems, AlignSelf, Anchor, Direction, FlexDirection, FlexWrap,
+        MainAxisAlign, Overflow, Position,
+    };
+    use zephyra_core::paint::Layer;
+    use zephyra_core::property::PropertyKey;
+    use zephyra_core::props;
+
+    fn filter(name: &str, args: &str) -> Option<Filter> {
+        let mut input = ParserInput::new(args);
+        let mut parser = Parser::new(&mut input);
+        filter_by_name(name, &mut parser)
+    }
+
+    fn shape(input: &str) -> Result<PropertyValue, ()> {
+        let mut p = crate::parse::test_parser("t.zstyle", input);
+        let mut input_source = ParserInput::new(input);
+        let mut parser = Parser::new(&mut input_source);
+        parse_corner_shape(&mut parser, &mut p, 1)
+    }
+
+    fn shape_with_errors(input: &str) -> (Result<PropertyValue, ()>, Vec<Error>) {
+        let mut p = crate::parse::test_parser("t.zstyle", input);
+        let mut input_source = ParserInput::new(input);
+        let mut parser = Parser::new(&mut input_source);
+        let out = parse_corner_shape(&mut parser, &mut p, 1);
+        (out, std::mem::take(&mut p.errors))
+    }
+
+    fn assert_enum<T: PartialEq + std::fmt::Debug + Clone + 'static>(
+        key: &'static PropertyKey,
+        word: &str,
+        want: T,
+    ) {
+        let got = enum_value(key, word)
+            .unwrap_or_else(|| panic!("'{word}' should map for {}", key.name()));
+        assert_eq!(got.get::<T>(), Some(want), "key={} word={word}", key.name());
+    }
+
+    #[test]
+    fn parse_hex_color_expands_three_digit_forms() {
+        assert_eq!(
+            parse_hex_color("fff"),
+            Some(Color::rgba(1.0, 1.0, 1.0, 1.0))
+        );
+        assert_eq!(
+            parse_hex_color("#000"),
+            Some(Color::rgba(0.0, 0.0, 0.0, 1.0))
+        );
+        assert_eq!(
+            parse_hex_color("#f00"),
+            Some(Color::rgba(1.0, 0.0, 0.0, 1.0))
+        );
+        // 每个 16 进制位摊成两位：a→aa=170、b→bb=187、c→cc=204。
+        assert_eq!(
+            parse_hex_color("#abc"),
+            Some(Color::rgba(
+                170.0 / 255.0,
+                187.0 / 255.0,
+                204.0 / 255.0,
+                1.0
+            ))
+        );
+        assert_eq!(parse_hex_color("#abc"), parse_hex_color("#aabbcc"));
+        // 所有前导 '#' 都会被剥掉，而不只是第一个。
+        assert_eq!(
+            parse_hex_color("##ff0000"),
+            Some(Color::rgba(1.0, 0.0, 0.0, 1.0))
+        );
+    }
+
+    #[test]
+    fn parse_hex_color_parses_six_and_eight_digit_forms() {
+        assert_eq!(
+            parse_hex_color("ff0000"),
+            Some(Color::rgba(1.0, 0.0, 0.0, 1.0))
+        );
+        assert_eq!(
+            parse_hex_color("#00ff00"),
+            Some(Color::rgba(0.0, 1.0, 0.0, 1.0))
+        );
+        assert_eq!(
+            parse_hex_color("#0000ff"),
+            Some(Color::rgba(0.0, 0.0, 1.0, 1.0))
+        );
+        // 后两位是 alpha，不做预乘。
+        assert_eq!(
+            parse_hex_color("#ff000080"),
+            Some(Color::rgba(1.0, 0.0, 0.0, 128.0 / 255.0))
+        );
+        assert_eq!(
+            parse_hex_color("#00000000"),
+            Some(Color::rgba(0.0, 0.0, 0.0, 0.0))
+        );
+        assert_eq!(
+            parse_hex_color("#ffffffff"),
+            Some(Color::rgba(1.0, 1.0, 1.0, 1.0))
+        );
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_unsupported_widths_and_non_hex() {
+        // 4 位简写（#rgba）明确不在支持列表里：只列了 3 / 6 / 8。
+        for bad in ["#abcd", "#fff8", "#0000"] {
+            assert_eq!(parse_hex_color(bad), None, "bad={bad}");
+        }
+        for bad in [
+            "",
+            "#",
+            "#12",
+            "#12345",
+            "#1234567",
+            "#123456789",
+            "#gg0000",
+            "#12x456",
+            "xyz",
+        ] {
+            assert_eq!(parse_hex_color(bad), None, "bad={bad}");
+        }
+    }
+
+    #[test]
+    fn filter_by_name_parses_blur_with_one_or_two_numbers() {
+        assert_eq!(
+            filter("blur", "4px"),
+            Some(Filter::Blur {
+                sigma_x: 4.0,
+                sigma_y: 4.0
+            })
+        );
+        assert_eq!(
+            filter("blur", "3px, 6px"),
+            Some(Filter::Blur {
+                sigma_x: 3.0,
+                sigma_y: 6.0
+            })
+        );
+        // cssparser 的 `unit_value` 是 0..1（50% → 0.5），这里照单全收。
+        assert_eq!(
+            filter("blur", "50%"),
+            Some(Filter::Blur {
+                sigma_x: 0.5,
+                sigma_y: 0.5
+            })
+        );
+        assert_eq!(filter("blur", ""), None, "没有参数不能猜一个 σ");
+    }
+
+    #[test]
+    fn filter_by_name_parses_refraction_defaults_and_explicit_arguments() {
+        assert_eq!(
+            filter("refraction", "16px"),
+            Some(Filter::Refraction {
+                strength: 16.0,
+                bezel: 20.0,
+                dispersion: 0.0,
+                ior: 1.5,
+            })
+        );
+        assert_eq!(
+            filter("refraction", "24px, 20px, 0.3, 1.5"),
+            Some(Filter::Refraction {
+                strength: 24.0,
+                bezel: 20.0,
+                dispersion: 0.3,
+                ior: 1.5,
+            })
+        );
+        assert_eq!(
+            filter("refraction", "10px, 4px"),
+            Some(Filter::Refraction {
+                strength: 10.0,
+                bezel: 4.0,
+                dispersion: 0.0,
+                ior: 1.5,
+            })
+        );
+        assert_eq!(filter("refraction", ""), None);
+    }
+
+    #[test]
+    fn filter_by_name_parses_drop_shadow_offset_blur_and_color() {
+        assert_eq!(
+            filter("drop-shadow", "0px 4px"),
+            Some(Filter::DropShadow {
+                color: Color::rgba(0.0, 0.0, 0.0, 0.4),
+                offset: Point::new(0.0, 4.0),
+                sigma: 0.0,
+            })
+        );
+        assert_eq!(
+            filter("drop-shadow", "1px 2px 3px #00000080"),
+            Some(Filter::DropShadow {
+                color: Color::rgba(0.0, 0.0, 0.0, 128.0 / 255.0),
+                offset: Point::new(1.0, 2.0),
+                sigma: 3.0,
+            })
+        );
+        assert_eq!(filter("drop-shadow", "4px"), None, "只有一个数不够成偏移");
+        assert_eq!(filter("drop-shadow", ""), None);
+    }
+
+    #[test]
+    fn filter_by_name_rejects_unknown_names() {
+        assert_eq!(filter("bogus", "1px"), None);
+        assert_eq!(filter("", "1px"), None);
+        assert_eq!(filter("BLUR", "1px"), None, "函数名不在这里做大小写归一");
+    }
+
+    #[test]
+    fn enum_value_maps_material_and_position_keywords() {
+        assert_enum(&props::MATERIAL, "solid", Material::solid());
+        assert_enum(&props::MATERIAL, "frosted", Material::frosted());
+        assert_enum(&props::MATERIAL, "glass", Material::glass());
+        assert_enum(&props::MATERIAL, "glass-refract", Material::glass_refract());
+
+        assert_enum(&props::POSITION, "flow", Position::Flow);
+        assert_enum(&props::POSITION, "parent", Position::Parent);
+        assert_enum(&props::POSITION, "root", Position::Root);
+        // D1 clean-break：迁移映射在 parse() 里报，这里必须返回 None。
+        assert_eq!(enum_value(&props::POSITION, "static"), None);
+        assert_eq!(enum_value(&props::POSITION, "absolute"), None);
+        assert_eq!(enum_value(&props::POSITION, "fixed"), None);
+    }
+
+    #[test]
+    fn enum_value_maps_all_layout_keyword_tables() {
+        assert_enum(&props::DIRECTION, "horizontal", Direction::Horizontal);
+        assert_enum(&props::DIRECTION, "vertical", Direction::Vertical);
+
+        assert_enum(&props::ANCHOR, "top-left", Anchor::TopLeft);
+        assert_enum(&props::ANCHOR, "center", Anchor::Center);
+        assert_enum(&props::ANCHOR, "bottom-right", Anchor::BottomRight);
+
+        assert_enum(&props::OVERFLOW, "visible", Overflow::Visible);
+        assert_enum(&props::OVERFLOW, "hidden", Overflow::Hidden);
+        assert_enum(&props::OVERFLOW, "scroll", Overflow::Scroll);
+        assert_enum(&props::OVERFLOW, "auto", Overflow::Auto);
+
+        assert_enum(&props::LAYER, "background", Layer::Background);
+        assert_enum(&props::LAYER, "popup", Layer::Popup);
+
+        assert_enum(&props::CROSS_ALIGN, "start", AlignItems::Start);
+        assert_enum(&props::CROSS_ALIGN, "stretch", AlignItems::Stretch);
+        assert_enum(
+            &props::MAIN_ALIGN,
+            "space-between",
+            MainAxisAlign::SpaceBetween,
+        );
+        assert_enum(
+            &props::MAIN_ALIGN,
+            "space-evenly",
+            MainAxisAlign::SpaceEvenly,
+        );
+
+        assert_enum(&props::FLEX_WRAP, "nowrap", FlexWrap::NoWrap);
+        assert_enum(&props::FLEX_WRAP, "wrap-reverse", FlexWrap::WrapReverse);
+        assert_enum(&props::FLEX_DIRECTION, "row", FlexDirection::Row);
+        assert_enum(
+            &props::FLEX_DIRECTION,
+            "column-reverse",
+            FlexDirection::ColumnReverse,
+        );
+
+        assert_enum(&props::ALIGN_CONTENT, "stretch", AlignContent::Stretch);
+        assert_enum(
+            &props::ALIGN_CONTENT,
+            "space-around",
+            AlignContent::SpaceAround,
+        );
+        assert_enum(&props::ALIGN_SELF, "auto", AlignSelf::Auto);
+        assert_enum(&props::ALIGN_SELF, "center", AlignSelf::Center);
+    }
+
+    #[test]
+    fn enum_value_is_key_scoped_and_ascii_case_insensitive() {
+        assert_enum(&props::DIRECTION, "VERTICAL", Direction::Vertical);
+        assert_enum(&props::CROSS_ALIGN, "Center", AlignItems::Center);
+        assert_enum(&props::MATERIAL, "GLASS", Material::glass());
+
+        // 同一个词换属性就不再合法：全局认词会把非法组合静默变成合法值。
+        assert_eq!(enum_value(&props::WIDTH, "vertical"), None);
+        assert_eq!(enum_value(&props::WIDTH, "center"), None);
+        assert_eq!(enum_value(&props::DIRECTION, "center"), None);
+        assert_eq!(enum_value(&props::MATERIAL, "nope"), None);
+        assert_eq!(enum_value(&props::ANCHOR, "top"), None);
+        assert_eq!(enum_value(&props::MAIN_ALIGN, "stretch"), None);
+    }
+
+    #[test]
+    fn parse_corner_shape_maps_every_keyword() {
+        for (word, want) in [
+            ("round", CornerShape::ROUND),
+            ("squircle", CornerShape::SQUIRCLE),
+            ("bevel", CornerShape::BEVEL),
+            ("scoop", CornerShape::SCOOP),
+            ("square", CornerShape::SQUARE),
+            ("notch", CornerShape::NOTCH),
+        ] {
+            let value = shape(word).unwrap_or_else(|_| panic!("{word} should parse"));
+            assert_eq!(value.get::<CornerShape>(), Some(want), "word={word}");
+        }
+        let value = shape("SQUIRCLE").unwrap();
+        assert_eq!(value.get::<CornerShape>(), Some(CornerShape::SQUIRCLE));
+    }
+
+    #[test]
+    fn parse_corner_shape_parses_superellipse_and_reports_bad_input() {
+        let value = shape("superellipse(2)").unwrap();
+        assert_eq!(
+            value.get::<CornerShape>(),
+            Some(CornerShape::superellipse(2.0))
+        );
+        let value = shape("superellipse(-1)").unwrap();
+        assert_eq!(
+            value.get::<CornerShape>(),
+            Some(CornerShape::superellipse(-1.0))
+        );
+
+        for bad in ["not-a-shape", "superellipse()", "12px", "#fff"] {
+            let (out, errors) = shape_with_errors(bad);
+            assert!(out.is_err(), "bad={bad}");
+            assert_eq!(errors.len(), 1, "bad={bad} must report exactly one error");
+        }
+        let (out, errors) = shape_with_errors("superellipse(2)");
+        assert!(out.is_ok());
+        assert!(errors.is_empty(), "合法写法不该记错误");
+    }
+}

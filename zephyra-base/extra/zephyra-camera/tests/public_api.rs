@@ -9,9 +9,12 @@ use zephyra_camera::{
     select_from_candidates, Backend, CandidateSelection, ControlRange, ControlValue, DeviceIndex,
     DeviceInfo, DropLog, DropReason, EwmaFrameRate, FailureKind, FormatCandidate, FormatInfo,
     FormatPreference, FrameRateEstimator, Nv12Planes, PacingController, PacingDecision,
-    PixelFormat, PowerLineFrequency, QualitySettings, RecoveryAction, RecoveryController,
-    RecoveryPolicy, RejectReason, Resolution,
+    PixelFormat, QualitySettings, RecoveryAction, RecoveryController, RecoveryPolicy, RejectReason,
+    Resolution,
 };
+// 仅在 serde 往返测试里用到；默认 feature 下不能无条件导入（clippy -D warnings）。
+#[cfg(feature = "serde")]
+use zephyra_camera::PowerLineFrequency;
 
 fn ms(value: u64) -> Duration {
     Duration::from_millis(value)

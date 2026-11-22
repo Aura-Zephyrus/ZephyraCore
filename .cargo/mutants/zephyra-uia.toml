@@ -1,0 +1,27 @@
+# cargo-mutants 配置：zephyra-uia（BASE 集，UI Automation 提供程序）。
+# 运行（workspace root）：
+#   cargo mutants -p zephyra-uia --config .cargo/mutants/zephyra-uia.toml --in-place
+# `--in-place` 只能由命令行给出（见 cargo-mutants options.rs），故不写在这里。
+
+# 平台 crate 的有意收窄：bridge.rs / provider.rs / subclass.rs 依赖真实 COM /
+# 可访问性树，headless 环境无法运行其测试；只变异纯数据/规则 helper（model.rs /
+# rules.rs）。详见 zephyra-core/MUTATION_TESTING.md 的"平台 crate 作用域"。
+examine_globs = [
+  "zephyra-base/extra/zephyra-uia/src/model.rs",
+  "zephyra-base/extra/zephyra-uia/src/rules.rs",
+]
+
+test_package = ["zephyra-uia"]
+
+output = "mutants.out/zephyra-uia"
+
+timeout_multiplier = 4.0
+build_timeout_multiplier = 4.0
+
+copy_target = false
+skip_calls_defaults = true
+
+# 等价变异裁决：确认无行为差异后，把其 `--list` 名称的正则写入 exclude_re
+# （schema: 字符串数组，正则匹配 `cargo mutants --list` 输出的名称），逐条写明理由。
+# 不允许宽泛正则批量豁免；流程见 zephyra-core/MUTATION_TESTING.md。
+# exclude_re = ["replace <exact mutant name from --list> with its anchored regex"]

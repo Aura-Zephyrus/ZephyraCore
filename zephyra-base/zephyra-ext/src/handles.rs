@@ -110,3 +110,110 @@ impl Drop for HookHandle {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ext_context::{ExtContextHandle, ExtContextImpl};
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use zephyra_render_ext::prelude::{BackendCapabilities, DrawHook, FrameId, RegisteredTexture};
+
+    #[test]
+    fn external_texture_handle_key_and_dead_context_update() {
+        let h = ExternalTextureHandle::new(Cow::Borrowed("tex-key"), Weak::new(), true);
+        assert_eq!(h.key(), "tex-key");
+        // A dead Weak cannot be upgraded -> ContextDropped before any frame check.
+        let err = h
+            .update(FrameDesc::rgba(vec![0; 4], 1, 1, 4), FrameId(2))
+            .unwrap_err();
+        assert!(matches!(err, ExtError::ContextDropped));
+    }
+
+    #[test]
+    fn hook_handle_kind_and_window_getters() {
+        let global = HookHandle::new(Cow::Borrowed("debug"), None, Weak::new());
+        assert_eq!(global.kind(), "debug");
+        assert_eq!(global.window(), None);
+        let scoped = HookHandle::new(Cow::Borrowed("per-win"), Some(42), Weak::new());
+        assert_eq!(scoped.kind(), "per-win");
+        assert_eq!(scoped.window(), Some(42));
+    }
+
+    /// Smallest live context needed to exercise `ExternalTextureHandle::update`.
+    struct MockImpl {
+        frame: FrameId,
+        frames: Rc<Cell<u32>>,
+    }
+
+    impl ExtContextImpl for MockImpl {
+        fn submit_frame(
+            &mut self,
+            key: Cow<'static, str>,
+            _desc: FrameDesc,
+            valid_until: FrameId,
+        ) -> Result<RegisteredTexture, ExtError> {
+            self.frames.set(self.frames.get() + 1);
+            Ok(RegisteredTexture { key, valid_until })
+        }
+        fn unregister_texture(&mut self, _key: &str) -> Result<(), ExtError> {
+            Ok(())
+        }
+        fn register_hook(
+            &mut self,
+            _kind: Cow<'static, str>,
+            _hook: Box<DrawHook>,
+        ) -> Result<(), ExtError> {
+            Ok(())
+        }
+        fn unregister_hook(&mut self, _kind: &str, _window: Option<u64>) -> bool {
+            true
+        }
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::none()
+        }
+        fn frame_id(&self) -> FrameId {
+            self.frame
+        }
+    }
+
+    #[test]
+    fn external_texture_handle_update_valid_expired_and_context_dropped() {
+        let frames = Rc::new(Cell::new(0));
+        let h = ExtContextHandle::new(Box::new(MockImpl {
+            frame: FrameId(1),
+            frames: frames.clone(),
+        }));
+        let tex = h
+            .submit_frame("u", FrameDesc::rgba(vec![0; 4], 1, 1, 4), FrameId(10))
+            .expect("submit");
+        assert_eq!(tex.key(), "u");
+        let after_submit = frames.get();
+
+        // valid_until <= current frame is rejected before reaching the backend.
+        let err = tex
+            .update(FrameDesc::rgba(vec![1; 4], 1, 1, 4), FrameId(1))
+            .unwrap_err();
+        assert!(
+            matches!(err, ExtError::ExpiredFrame { valid_until, current } if valid_until == FrameId(1) && current == FrameId(1)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            frames.get(),
+            after_submit,
+            "expired update must not reach the backend"
+        );
+
+        // A valid update goes through the same submit_frame path.
+        tex.update(FrameDesc::rgba(vec![2; 4], 1, 1, 4), FrameId(11))
+            .expect("valid update");
+        assert_eq!(frames.get(), after_submit + 1);
+
+        // Dropping the context handle invalidates the Weak inside the texture handle.
+        drop(h);
+        let err = tex
+            .update(FrameDesc::rgba(vec![3; 4], 1, 1, 4), FrameId(12))
+            .unwrap_err();
+        assert!(matches!(err, ExtError::ContextDropped));
+    }
+}

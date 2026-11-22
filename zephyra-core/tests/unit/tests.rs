@@ -1672,3 +1672,252 @@ mod effect_contract {
         assert_eq!(style.font_features, vec![(u32::from_be_bytes(*b"tnum"), 1)]);
     }
 }
+
+// ============================== text_value ==============================
+
+/// `text_value` 的入参几乎总是运行期字符串，结果必须是 `PropertyValue::Str`
+/// （`Arc<str>`），**不能**退化成只给 `const` 默认值用的 `StaticStr`。
+#[test]
+fn text_value_wraps_borrowed_str_in_the_str_variant() {
+    use crate::text::text_value;
+
+    let v = text_value("hello");
+    match &v {
+        PropertyValue::Str(s) => assert_eq!(&**s, "hello"),
+        other => panic!("应为 Str 变体，实得 {other:?}"),
+    }
+    assert_ne!(
+        v,
+        PropertyValue::static_str("hello"),
+        "运行期文本不得走 StaticStr 变体"
+    );
+}
+
+/// 自有的 `String` 与 Unicode 内容都要原样带过去（不能截断、不能乱序）。
+#[test]
+fn text_value_preserves_owned_string_and_unicode_content() {
+    use crate::text::text_value;
+
+    let v = text_value(String::from("héllo 世界 🌍"));
+    match &v {
+        PropertyValue::Str(s) => assert_eq!(&**s, "héllo 世界 🌍"),
+        other => panic!("应为 Str 变体，实得 {other:?}"),
+    }
+}
+
+/// 函数签名收 `Into<Cow<'static, str>>`，两条 Cow 路径都得走到同一个变体。
+#[test]
+fn text_value_accepts_both_borrowed_and_owned_cow() {
+    use crate::text::text_value;
+    use std::borrow::Cow;
+
+    let borrowed = text_value(Cow::Borrowed("borrowed"));
+    match &borrowed {
+        PropertyValue::Str(s) => assert_eq!(&**s, "borrowed"),
+        other => panic!("应为 Str 变体，实得 {other:?}"),
+    }
+
+    let owned = text_value(Cow::Owned(String::from("owned")));
+    match &owned {
+        PropertyValue::Str(s) => assert_eq!(&**s, "owned"),
+        other => panic!("应为 Str 变体，实得 {other:?}"),
+    }
+    assert_ne!(borrowed, owned, "两种入参的内容不同，结果必须不同");
+}
+
+/// 空串是常见的占位值；不能因为"空"就被换成别的变体或默认值。
+#[test]
+fn text_value_keeps_empty_string_as_str_variant() {
+    use crate::text::text_value;
+
+    let v = text_value("");
+    match &v {
+        PropertyValue::Str(s) => assert_eq!(&**s, ""),
+        other => panic!("空串仍应是 Str 变体，实得 {other:?}"),
+    }
+}
+
+// ============================== Element::child_elements ==============================
+
+/// `child_elements` 是 `children()` 的 `&Element` 视图：数量、顺序、tag、key 都必须
+/// 与声明的子节点一一对应。顺序错乱会让 diff 把兄弟节点错配。
+#[test]
+fn child_elements_yields_every_child_in_declaration_order() {
+    use crate::id::ElementKey;
+
+    let e = Element::new(NodeTag::Box).with_children([
+        Element::new(NodeTag::Text).with_key("a"),
+        Element::new(NodeTag::Image).with_key("b"),
+        Element::new(NodeTag::Control).with_key("c"),
+    ]);
+    let got: Vec<_> = e
+        .child_elements()
+        .map(|c| (c.tag(), c.key().cloned()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (NodeTag::Text, Some(ElementKey::Name("a"))),
+            (NodeTag::Image, Some(ElementKey::Name("b"))),
+            (NodeTag::Control, Some(ElementKey::Name("c"))),
+        ]
+    );
+}
+
+/// 叶子返回空迭代；共享句柄路径下迭代出的引用必须就是原 `Arc` 里的那个元素，
+/// 而不是副本 —— diff 靠 `Arc::ptr_eq` 判断子树输入是否未变。
+#[test]
+fn child_elements_matches_shared_handles_by_identity_and_is_empty_for_leaves() {
+    use std::sync::Arc;
+
+    let leaf = Element::new(NodeTag::Text);
+    assert_eq!(leaf.child_elements().count(), 0);
+    assert_eq!(leaf.children().len(), 0);
+
+    let shared = [
+        Arc::new(Element::new(NodeTag::Box).with_key("x")),
+        Arc::new(Element::new(NodeTag::Box).with_key("y")),
+    ];
+    let e = Element::new(NodeTag::Box).with_shared_children(shared.iter().cloned());
+    let via_view: Vec<*const crate::element::Element> =
+        e.child_elements().map(|c| c as *const _).collect();
+    let via_arcs: Vec<*const crate::element::Element> = e
+        .children()
+        .iter()
+        .map(|c| c.as_ref() as *const _)
+        .collect();
+    assert_eq!(via_view.len(), 2);
+    assert_eq!(via_view, via_arcs);
+}
+
+// ============================== ElementKind::node_tag ==============================
+
+/// `ElementKind` 是给宿主实现元素类型的 trait；`node_tag` 的返回标签直接决定 diff
+/// 能否就地复用。用本地实现 + 泛型调用钉住方法名、签名与返回值。
+#[test]
+fn element_kind_node_tag_returns_the_declared_node_tag() {
+    use crate::id::{ElementKind, NodeTag};
+
+    struct TextKind;
+    impl ElementKind for TextKind {
+        fn node_tag(&self) -> NodeTag {
+            NodeTag::Text
+        }
+    }
+    struct ControlKind;
+    impl ElementKind for ControlKind {
+        fn node_tag(&self) -> NodeTag {
+            NodeTag::Control
+        }
+    }
+
+    fn tag_of<K: ElementKind>(kind: &K) -> NodeTag {
+        kind.node_tag()
+    }
+
+    assert_eq!(TextKind.node_tag(), NodeTag::Text);
+    assert_eq!(ControlKind.node_tag(), NodeTag::Control);
+    assert_eq!(tag_of(&TextKind), NodeTag::Text);
+    assert_eq!(tag_of(&ControlKind), NodeTag::Control);
+}
+
+// ============================== diff_with ==============================
+
+/// `diff_with` 是 `diff` 的复用缓冲版本。直接调用它，稳态必须同样是 no-op，
+/// 且统计与节点树都要正确。
+#[test]
+fn diff_with_direct_call_reports_steady_state_noop() {
+    use crate::diff::{diff_with, Scratch};
+
+    let element = sample();
+    let mut node = Node::from_element(&element);
+    crate::node::clear_dirty(&mut node);
+
+    let mut scratch = Scratch::default();
+    let stats = diff_with(&mut node, &element, &mut scratch);
+
+    assert!(stats.is_noop(), "实得 {stats:?}");
+    assert_eq!(stats.reused, 3, "根 + 两个子节点都应就地复用");
+    assert_eq!(stats.inserted, 0);
+    assert_eq!(stats.removed, 0);
+    assert_eq!(stats.moved, 0);
+    assert_eq!(stats.dirtied, 0);
+    assert_eq!(stats.needs_layout, 0);
+    assert_eq!(node.children().len(), 2);
+}
+
+/// tag 不一致时 `diff_with` 必须整节点替换，并且不走子树对账。
+#[test]
+fn diff_with_direct_call_replaces_whole_node_on_tag_change() {
+    use crate::diff::{diff_with, Scratch};
+
+    let mut node = Node::from_element(&sample());
+    let mut scratch = Scratch::default();
+    let different = Element::new(NodeTag::Text).with_key("root");
+
+    let stats = diff_with(&mut node, &different, &mut scratch);
+
+    assert_eq!(stats.inserted, 1);
+    assert_eq!(stats.needs_layout, 1);
+    assert_eq!(stats.reused, 0);
+    assert_eq!(node.tag(), NodeTag::Text);
+    assert!(node.children().is_empty());
+}
+
+/// 同一个 `Scratch` 跨树、跨帧复用时，缓冲栈必须回到同一深度，不能串味。
+#[test]
+fn diff_with_reuses_one_scratch_across_several_trees() {
+    use crate::diff::{diff_with, Scratch};
+
+    let a = Element::new(NodeTag::Box).with_key("a").with_children([
+        Element::new(NodeTag::Text).with_key("a0"),
+        Element::new(NodeTag::Control).with_key("a1"),
+    ]);
+    let b = Element::new(NodeTag::Box)
+        .with_key("b")
+        .with_children([Element::new(NodeTag::Image).with_key("b0")]);
+    let mut node_a = Node::from_element(&a);
+    let mut node_b = Node::from_element(&b);
+    crate::node::clear_dirty(&mut node_a);
+    crate::node::clear_dirty(&mut node_b);
+
+    let mut scratch = Scratch::default();
+    let stats_a = diff_with(&mut node_a, &a, &mut scratch);
+    let stats_b = diff_with(&mut node_b, &b, &mut scratch);
+    assert!(stats_a.is_noop(), "实得 {stats_a:?}");
+    assert!(stats_b.is_noop(), "实得 {stats_b:?}");
+    assert_eq!(stats_a.reused, 3);
+    assert_eq!(stats_b.reused, 2);
+    assert_eq!(node_a.children().len(), 2);
+    assert_eq!(node_b.children().len(), 1);
+
+    // 再对同一棵树跑两遍：缓冲已还回栈里，每遍都应从干净状态得到同样的统计。
+    for _ in 0..2 {
+        let again = diff_with(&mut node_a, &a, &mut scratch);
+        assert!(again.is_noop(), "实得 {again:?}");
+        assert_eq!(again.reused, 3);
+    }
+}
+
+/// 直接调用也要正确报出"插入子节点"：插入数、复用数与重排需求都用字面量钉住。
+#[test]
+fn diff_with_direct_call_reports_inserted_child_and_layout() {
+    use crate::diff::{diff_with, Scratch};
+
+    let mut node = Node::from_element(&sample());
+    crate::node::clear_dirty(&mut node);
+    let bigger = Element::new(NodeTag::Box).with_key("root").with_children([
+        Element::new(NodeTag::Text).with_key("title"),
+        Element::new(NodeTag::Control).with_key("ok"),
+        Element::new(NodeTag::Control).with_key("cancel"),
+    ]);
+
+    let mut scratch = Scratch::default();
+    let stats = diff_with(&mut node, &bigger, &mut scratch);
+
+    assert_eq!(stats.inserted, 1);
+    assert_eq!(stats.removed, 0);
+    assert_eq!(stats.reused, 3);
+    assert!(stats.needs_layout(), "增删子节点必须重排父容器");
+    assert_eq!(node.children().len(), 3);
+}

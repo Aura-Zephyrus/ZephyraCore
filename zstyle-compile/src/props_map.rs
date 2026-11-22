@@ -413,3 +413,75 @@ pub(crate) fn lookup(css_name: &str) -> Option<&'static PropertyKey> {
 pub(crate) fn all_css_names() -> impl Iterator<Item = &'static str> {
     PROPS.iter().map(|p| p.css)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_maps_kebab_case_names_to_the_exact_static_keys() {
+        assert!(std::ptr::eq(lookup("width").unwrap(), &props::WIDTH));
+        assert!(std::ptr::eq(
+            lookup("corner-radius").unwrap(),
+            &props::CORNER_RADIUS
+        ));
+        assert!(std::ptr::eq(
+            lookup("text-size").unwrap(),
+            &props::TEXT_SIZE
+        ));
+        // 三个别名指向**同一个**键，不能各开一个新键。
+        assert!(std::ptr::eq(lookup("gap").unwrap(), &props::SPACING));
+        assert!(std::ptr::eq(lookup("spacing").unwrap(), &props::SPACING));
+        assert!(std::ptr::eq(
+            lookup("align-items").unwrap(),
+            &props::CROSS_ALIGN
+        ));
+        assert!(std::ptr::eq(
+            lookup("cross-align").unwrap(),
+            &props::CROSS_ALIGN
+        ));
+        assert!(std::ptr::eq(
+            lookup("justify-content").unwrap(),
+            &props::MAIN_ALIGN
+        ));
+        assert!(std::ptr::eq(
+            lookup("main-align").unwrap(),
+            &props::MAIN_ALIGN
+        ));
+    }
+
+    #[test]
+    fn lookup_is_exact_and_rejects_unknown_or_misspelled_names() {
+        for name in [
+            "Width",
+            "WIDTH",
+            "cornerRadius",
+            "corner_radius",
+            "coner-radius",
+            "background-color",
+            "display",
+            "color",
+            "",
+        ] {
+            assert!(lookup(name).is_none(), "name={name}");
+        }
+    }
+
+    #[test]
+    fn all_css_names_covers_every_mapping_and_agrees_with_lookup() {
+        let names: Vec<&'static str> = all_css_names().collect();
+        assert_eq!(names.len(), PROPS.len());
+        for prop in PROPS {
+            assert!(names.contains(&prop.css), "missing name {}", prop.css);
+            assert!(
+                std::ptr::eq(lookup(prop.css).unwrap(), prop.key),
+                "lookup disagrees for {}",
+                prop.css
+            );
+        }
+        // 名字是唯一入口：表里不该有重复的 CSS 名。
+        for (i, name) in names.iter().enumerate() {
+            assert!(!names[i + 1..].contains(name), "duplicate css name {name}");
+        }
+    }
+}

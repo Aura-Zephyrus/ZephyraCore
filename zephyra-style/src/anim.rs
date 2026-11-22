@@ -219,3 +219,83 @@ pub fn step_with(p: f32, steps: u32) -> Option<u32> {
     let n = (p * steps as f32).ceil() as u32;
     Some(n.clamp(1, steps))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn curve_is_the_single_source_of_control_points() {
+        assert_eq!(Easing::Linear.curve(), None);
+        assert_eq!(
+            Easing::Direct.curve().unwrap().control_points(),
+            (0.0, 0.0, 0.0, 1.0)
+        );
+        assert_eq!(
+            Easing::PointToPoint.curve().unwrap().control_points(),
+            (0.55, 0.55, 0.0, 1.0)
+        );
+        assert_eq!(
+            Easing::SoftExit.curve().unwrap().control_points(),
+            (1.0, 0.0, 1.0, 1.0)
+        );
+        assert_eq!(
+            Easing::AppleMenu.curve().unwrap().control_points(),
+            (0.22, 1.0, 0.36, 1.0)
+        );
+    }
+
+    #[test]
+    fn at_guards_non_finite_input_and_clamps_the_linear_curve() {
+        for e in [
+            Easing::Linear,
+            Easing::Direct,
+            Easing::PointToPoint,
+            Easing::SoftExit,
+            Easing::AppleMenu,
+        ] {
+            assert_eq!(e.at(f32::NAN), 0.0, "{e:?} NaN");
+            assert_eq!(e.at(f32::INFINITY), 0.0, "{e:?} +inf");
+            assert_eq!(e.at(f32::NEG_INFINITY), 0.0, "{e:?} -inf");
+        }
+        // 线性分支不迭代，直接夹到 0..1（零误差）。
+        assert_eq!(Easing::Linear.at(0.375), 0.375);
+        assert_eq!(Easing::Linear.at(-0.25), 0.0);
+        assert_eq!(Easing::Linear.at(1.5), 1.0);
+    }
+
+    #[test]
+    fn progress_folds_invalid_duration_elapsed_and_normal_time() {
+        // 时长非法 ⇒ 立即完成（返回 1 比 0 安全：0 会让动画永不结束）。
+        for dur in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(progress(0.0, dur, Easing::Linear), 1.0, "dur={dur}");
+        }
+        // elapsed 非正 / 非有限 ⇒ 从 0 开始（含 NaN 与 ±inf）。
+        assert_eq!(progress(f32::NAN, 100.0, Easing::Direct), 0.0);
+        assert_eq!(progress(f32::INFINITY, 100.0, Easing::SoftExit), 0.0);
+        assert_eq!(progress(-1.0, 100.0, Easing::AppleMenu), 0.0);
+        assert_eq!(progress(0.0, 100.0, Easing::Linear), 0.0);
+
+        // 正常路径：先算 raw = elapsed / dur，再过缓动。
+        assert_eq!(progress(25.0, 100.0, Easing::Linear), 0.25);
+        assert_eq!(progress(50.0, 100.0, Easing::Linear), 0.5);
+        assert_eq!(progress(150.0, 100.0, Easing::Linear), 1.0);
+    }
+
+    #[test]
+    fn step_with_clamps_to_literal_tiers() {
+        assert_eq!(step_with(0.0, 8), None);
+        assert_eq!(step_with(-0.1, 8), None);
+        assert_eq!(step_with(f32::NAN, 8), None);
+        assert_eq!(step_with(0.5, 0), None, "0 档没有可发的分类名");
+
+        assert_eq!(step_with(0.01, 8), Some(1));
+        assert_eq!(step_with(0.125, 8), Some(1));
+        assert_eq!(step_with(0.126, 8), Some(2));
+        assert_eq!(step_with(0.5, 8), Some(4));
+        assert_eq!(step_with(1.0, 8), Some(8));
+        assert_eq!(step_with(2.0, 8), Some(8), "超过 1 也不能越界");
+        assert_eq!(step_with(f32::INFINITY, 8), None, "非有限输入不发档位");
+        assert_eq!(step(0.5), Some(4), "默认密度就是 8 档");
+    }
+}

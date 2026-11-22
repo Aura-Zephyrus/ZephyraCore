@@ -1,0 +1,26 @@
+# cargo-mutants 配置：zephyra-dcomp（BASE 集，DirectComposition 合成器）。
+# 运行（workspace root）：
+#   cargo mutants -p zephyra-dcomp --config .cargo/mutants/zephyra-dcomp.toml --in-place
+# `--in-place` 只能由命令行给出（见 cargo-mutants options.rs），故不写在这里。
+
+# 平台 crate 的有意收窄：compositor.rs / swapchain.rs 依赖真实 COM/DXGI 设备，
+# 其测试带 #[ignore]（见 src/tests/swapchain_tests.rs），headless 环境杀不死变异体；
+# lib.rs 里的 SwapchainDesc / base_swapchain_desc / create_factory 等纯 helper
+# 有可执行的 lib_tests.rs，故只变异 lib.rs。详见 zephyra-core/MUTATION_TESTING.md
+# 的"平台 crate 作用域"。
+examine_globs = ["zephyra-base/zephyra-dcomp/src/lib.rs"]
+
+test_package = ["zephyra-dcomp"]
+
+output = "mutants.out/zephyra-dcomp"
+
+timeout_multiplier = 4.0
+build_timeout_multiplier = 4.0
+
+copy_target = false
+skip_calls_defaults = true
+
+# 等价变异裁决：确认无行为差异后，把其 `--list` 名称的正则写入 exclude_re
+# （schema: 字符串数组，正则匹配 `cargo mutants --list` 输出的名称），逐条写明理由。
+# 不允许宽泛正则批量豁免；流程见 zephyra-core/MUTATION_TESTING.md。
+# exclude_re = ["replace <exact mutant name from --list> with its anchored regex"]

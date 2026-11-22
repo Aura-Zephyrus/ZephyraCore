@@ -497,3 +497,602 @@ fn element_fingerprint(
         e.child_elements().count(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::BinOp;
+    use crate::ir::{ElementNode, ForNode, IfNode, Page, UseNode};
+    use zephyra_core::id::{ElementKey, NodeTag};
+    use zephyra_core::property::PropertyValue;
+
+    /// 标志位顺序：hover, press, focused, key, tr, render-source, dynamic, uncacheable。
+    fn flags(m: &DepMask) -> (bool, bool, bool, bool, bool, bool, bool, bool) {
+        (
+            m.uses_hover,
+            m.uses_press,
+            m.uses_focused,
+            m.uses_key,
+            m.uses_tr,
+            m.uses_render_source_attr,
+            m.dynamic_interaction,
+            m.uncacheable,
+        )
+    }
+
+    fn mask_of(e: &Expr) -> DepMask {
+        let mut m = DepMask::default();
+        mask_expr(e, &mut m);
+        m
+    }
+
+    fn class_mask(t: &ClassTok) -> DepMask {
+        let mut m = DepMask::default();
+        mask_class(t, &mut m);
+        m
+    }
+
+    fn node_mask(node: &Node) -> DepMask {
+        let raw = RawUi {
+            components: vec![],
+            pages: vec![],
+        };
+        let comps = HashMap::new();
+        let mut visiting = Vec::new();
+        let mut out = DepMask::default();
+        mask_node(node, &comps, &raw, &mut visiting, &mut out);
+        out
+    }
+
+    fn use_mask(raw: &RawUi, node: &Node) -> DepMask {
+        let mut comps = HashMap::new();
+        for (i, c) in raw.components.iter().enumerate() {
+            comps.insert(c.name, i);
+        }
+        let mut visiting = Vec::new();
+        let mut out = DepMask::default();
+        mask_node(node, &comps, raw, &mut visiting, &mut out);
+        out
+    }
+
+    fn el(key: Option<Expr>, classes: Vec<ClassTok>, attrs: Vec<(&'static str, Expr)>) -> Node {
+        Node::El(ElementNode {
+            tag: NodeTag::Box,
+            key,
+            classes,
+            attrs,
+            children: vec![],
+        })
+    }
+
+    fn use_node(comp: &'static str, children: Vec<Node>) -> Node {
+        Node::Use(UseNode {
+            comp,
+            key: None,
+            class_extra: vec![],
+            args: vec![],
+            children,
+        })
+    }
+
+    struct EmptyHost;
+
+    impl Host for EmptyHost {
+        fn binding(&self, _name: &str) -> Option<Val> {
+            None
+        }
+        fn tr(&self, key: &'static str) -> &'static str {
+            key
+        }
+        fn hovers(&self, _key: &str) -> bool {
+            false
+        }
+        fn holds(&self, _key: &str) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn mix_site_pins_exact_hashes() {
+        assert_eq!(mix_site(0, 0, 0), 0);
+        assert_eq!(mix_site(1, 2, 3), 11318103724633734439);
+        assert_eq!(mix_site(0xDEAD_BEEF, 7, 21), 18098238933156416668);
+        assert_eq!(mix_site(255, 255, 255), 9480753263772062864);
+        assert_eq!(mix_site(100, 5, 42), 13157424463941904006);
+    }
+
+    #[test]
+    fn mix_site_is_deterministic_and_sensitive_to_each_input() {
+        let base = mix_site(10, 20, 30);
+        assert_eq!(base, mix_site(10, 20, 30));
+        assert_ne!(base, mix_site(11, 20, 30));
+        assert_ne!(base, mix_site(10, 21, 30));
+        assert_ne!(base, mix_site(10, 20, 31));
+        let a = mix_site(0, 0, 1);
+        let b = mix_site(0, 1, 0);
+        let c = mix_site(1, 0, 0);
+        assert!(a != b && b != c && a != c);
+    }
+
+    #[test]
+    fn dep_mask_merge_is_union_with_binding_dedup() {
+        let mut a = DepMask {
+            bindings: vec!["x", "y"],
+            uses_hover: true,
+            uses_key: true,
+            ..DepMask::default()
+        };
+        let b = DepMask {
+            bindings: vec!["y", "z"],
+            uses_press: true,
+            uses_focused: true,
+            uses_tr: true,
+            uses_render_source_attr: true,
+            dynamic_interaction: true,
+            uncacheable: true,
+            ..DepMask::default()
+        };
+        a.merge(&b);
+        assert_eq!(a.bindings, vec!["x", "y", "z"]);
+        assert_eq!(flags(&a), (true, true, true, true, true, true, true, true));
+        let once = a.clone();
+        a.merge(&b);
+        assert_eq!(a.bindings, once.bindings, "merge 幂等");
+        assert_eq!(flags(&a), flags(&once));
+    }
+
+    #[test]
+    fn dep_mask_merge_empty_is_identity_and_copies_into_empty() {
+        let full = DepMask {
+            bindings: vec!["a", "b"],
+            uses_hover: true,
+            uses_press: true,
+            uses_focused: true,
+            uses_key: true,
+            uses_tr: true,
+            uses_render_source_attr: true,
+            dynamic_interaction: true,
+            uncacheable: true,
+        };
+        let mut into = DepMask::default();
+        into.merge(&full);
+        assert_eq!(into.bindings, vec!["a", "b"]);
+        assert_eq!(
+            flags(&into),
+            (true, true, true, true, true, true, true, true)
+        );
+
+        let mut keep = full.clone();
+        keep.merge(&DepMask::default());
+        assert_eq!(keep.bindings, vec!["a", "b"]);
+        assert_eq!(
+            flags(&keep),
+            (true, true, true, true, true, true, true, true)
+        );
+    }
+
+    #[test]
+    fn dep_mask_can_cache_only_depends_on_uncacheable() {
+        assert!(DepMask::default().can_cache());
+        let mut m = DepMask {
+            bindings: vec!["x"],
+            uses_hover: true,
+            uses_press: true,
+            uses_focused: true,
+            uses_key: true,
+            uses_tr: true,
+            uses_render_source_attr: true,
+            dynamic_interaction: true,
+            uncacheable: false,
+        };
+        assert!(m.can_cache(), "其它依赖标志不剥夺缓存资格");
+        m.uncacheable = true;
+        assert!(!m.can_cache());
+        m.uncacheable = false;
+        assert!(m.can_cache());
+        let other = DepMask {
+            uncacheable: true,
+            ..DepMask::default()
+        };
+        m.merge(&other);
+        assert!(!m.can_cache(), "merge 传入 uncacheable 后不可缓存");
+    }
+
+    #[test]
+    fn mask_expr_literals_and_refs_set_exact_flags() {
+        let lit = mask_of(&Expr::LitS("x"));
+        assert!(lit.bindings.is_empty());
+        assert_eq!(
+            flags(&lit),
+            (false, false, false, false, false, false, false, false)
+        );
+        for e in [Expr::LitF(1.0), Expr::LitB(true)] {
+            let m = mask_of(&e);
+            assert!(m.bindings.is_empty());
+            assert_eq!(
+                flags(&m),
+                (false, false, false, false, false, false, false, false)
+            );
+        }
+
+        assert_eq!(
+            flags(&mask_of(&Expr::Ref("hover"))),
+            (true, false, false, false, false, false, false, false)
+        );
+        assert_eq!(
+            flags(&mask_of(&Expr::Ref("press"))),
+            (false, true, false, false, false, false, false, false)
+        );
+        assert_eq!(
+            flags(&mask_of(&Expr::Ref("focused"))),
+            (false, false, true, false, false, false, false, false)
+        );
+        assert_eq!(
+            flags(&mask_of(&Expr::Ref("key"))),
+            (false, false, false, true, false, false, false, false)
+        );
+        let other = mask_of(&Expr::Ref("other"));
+        assert!(other.bindings.is_empty());
+        assert_eq!(
+            flags(&other),
+            (false, false, false, false, false, false, false, false)
+        );
+    }
+
+    #[test]
+    fn mask_expr_bindings_and_calls_set_exact_flags() {
+        let m = mask_of(&Expr::Binding("x"));
+        assert_eq!(m.bindings, vec!["x"]);
+        assert_eq!(
+            flags(&m),
+            (false, false, false, false, false, false, false, false)
+        );
+
+        let m = mask_of(&Expr::Call("tr", vec![Expr::LitS("k")]));
+        assert!(m.bindings.is_empty());
+        assert_eq!(
+            flags(&m),
+            (false, false, false, false, true, false, false, false)
+        );
+
+        let m = mask_of(&Expr::Call("hover", vec![Expr::LitS("k")]));
+        assert_eq!(
+            flags(&m),
+            (false, false, false, false, false, false, true, false)
+        );
+
+        let m = mask_of(&Expr::Call("press", vec![]));
+        assert_eq!(
+            flags(&m),
+            (false, false, false, false, false, false, false, false),
+            "空参调用不置 dynamic"
+        );
+
+        let m = mask_of(&Expr::Call("focused", vec![Expr::Binding("k")]));
+        assert_eq!(m.bindings, vec!["k"]);
+        assert_eq!(
+            flags(&m),
+            (false, false, false, false, false, false, true, false)
+        );
+
+        let m = mask_of(&Expr::Call(
+            "min",
+            vec![Expr::Binding("a"), Expr::Ref("key")],
+        ));
+        assert_eq!(m.bindings, vec!["a"]);
+        assert_eq!(
+            flags(&m),
+            (false, false, false, true, false, false, false, false)
+        );
+    }
+
+    #[test]
+    fn mask_expr_nested_operators_recurse_and_dedup() {
+        let e = Expr::Bin(
+            BinOp::Add,
+            Box::new(Expr::Binding("a")),
+            Box::new(Expr::Bin(
+                BinOp::Mul,
+                Box::new(Expr::Binding("a")),
+                Box::new(Expr::Ref("hover")),
+            )),
+        );
+        let m = mask_of(&e);
+        assert_eq!(m.bindings, vec!["a"], "重复绑定去重");
+        assert_eq!(
+            flags(&m),
+            (true, false, false, false, false, false, false, false)
+        );
+
+        let e = Expr::Cond(
+            Box::new(Expr::Ref("focused")),
+            Box::new(Expr::Not(Box::new(Expr::Binding("c")))),
+            Box::new(Expr::Neg(Box::new(Expr::Ref("press")))),
+        );
+        let m = mask_of(&e);
+        assert_eq!(m.bindings, vec!["c"]);
+        assert_eq!(
+            flags(&m),
+            (false, true, true, false, false, false, false, false)
+        );
+
+        let m = mask_of(&Expr::Field(Box::new(Expr::Binding("rec")), "id"));
+        assert_eq!(m.bindings, vec!["rec"]);
+        assert_eq!(
+            flags(&m),
+            (false, false, false, false, false, false, false, false)
+        );
+    }
+
+    #[test]
+    fn mask_class_masks_only_condition_expression() {
+        let m = class_mask(&ClassTok::Lit("hero"));
+        assert_eq!(
+            flags(&m),
+            (false, false, false, false, false, false, false, false)
+        );
+
+        let m = class_mask(&ClassTok::If {
+            cond: Expr::Ref("hover"),
+            tok: "hovered",
+        });
+        assert_eq!(
+            flags(&m),
+            (true, false, false, false, false, false, false, false)
+        );
+
+        let m = class_mask(&ClassTok::Dyn(Expr::Binding("variant")));
+        assert_eq!(m.bindings, vec!["variant"]);
+        assert_eq!(
+            flags(&m),
+            (false, false, false, false, false, false, false, false)
+        );
+    }
+
+    #[test]
+    fn mask_node_element_if_for_collect_all_deps() {
+        let nested = Node::El(ElementNode {
+            tag: NodeTag::Text,
+            key: None,
+            classes: vec![ClassTok::Dyn(Expr::Ref("press"))],
+            attrs: vec![],
+            children: vec![],
+        });
+        let m = node_mask(&Node::El(ElementNode {
+            tag: NodeTag::Box,
+            key: Some(Expr::Ref("key")),
+            classes: vec![
+                ClassTok::Lit("hero"),
+                ClassTok::If {
+                    cond: Expr::Ref("hover"),
+                    tok: "h",
+                },
+            ],
+            attrs: vec![
+                ("render-source", Expr::LitS("v")),
+                ("text", Expr::Binding("label")),
+            ],
+            children: vec![nested],
+        }));
+        assert_eq!(m.bindings, vec!["label"]);
+        assert_eq!(
+            flags(&m),
+            (true, true, false, true, false, true, false, false)
+        );
+
+        let m = node_mask(&Node::If(IfNode {
+            cond: Expr::Ref("focused"),
+            then: vec![el(Some(Expr::Binding("a")), vec![], vec![])],
+            els: vec![el(Some(Expr::Binding("b")), vec![], vec![])],
+        }));
+        assert_eq!(m.bindings, vec!["a", "b"]);
+        assert_eq!(
+            flags(&m),
+            (false, false, true, false, false, false, false, false)
+        );
+
+        let m = node_mask(&Node::For(ForNode {
+            var: "item",
+            index: None,
+            track_key: Some(Expr::Binding("id")),
+            list: Expr::Binding("items"),
+            body: vec![el(Some(Expr::Ref("press")), vec![], vec![])],
+        }));
+        assert_eq!(m.bindings, vec!["items", "id"], "list 先于 track_key");
+        assert_eq!(
+            flags(&m),
+            (false, true, false, false, false, false, false, false)
+        );
+    }
+
+    #[test]
+    fn mask_node_use_uncacheable_cases() {
+        let good_raw = RawUi {
+            components: vec![crate::Component {
+                name: "Btn",
+                params: vec![],
+                body: vec![el(
+                    Some(Expr::Ref("hover")),
+                    vec![],
+                    vec![("text", Expr::Binding("label"))],
+                )],
+            }],
+            pages: vec![],
+        };
+        let m = use_mask(
+            &good_raw,
+            &Node::Use(UseNode {
+                comp: "Btn",
+                key: Some(Expr::Ref("key")),
+                class_extra: vec![ClassTok::Dyn(Expr::Binding("variant"))],
+                args: vec![],
+                children: vec![],
+            }),
+        );
+        assert_eq!(
+            m.bindings,
+            vec!["variant", "label"],
+            "class_extra 先于组件体"
+        );
+        assert_eq!(
+            flags(&m),
+            (true, false, false, true, false, false, false, false)
+        );
+        assert!(m.can_cache(), "无 slot、无 children、已知组件仍可缓存");
+
+        let m = use_mask(
+            &good_raw,
+            &use_node(
+                "Btn",
+                vec![el(Some(Expr::Binding("child")), vec![], vec![])],
+            ),
+        );
+        assert_eq!(m.bindings, vec!["child", "label"], "children 先于组件体");
+        assert_eq!(
+            flags(&m),
+            (true, false, false, false, false, false, false, true)
+        );
+
+        let empty_raw = RawUi {
+            components: vec![],
+            pages: vec![],
+        };
+        let m = use_mask(&empty_raw, &use_node("Missing", vec![]));
+        assert_eq!(
+            flags(&m),
+            (false, false, false, false, false, false, false, true)
+        );
+
+        let slot_raw = RawUi {
+            components: vec![crate::Component {
+                name: "SlotC",
+                params: vec![],
+                body: vec![Node::Slot],
+            }],
+            pages: vec![],
+        };
+        let m = use_mask(&slot_raw, &use_node("SlotC", vec![]));
+        assert_eq!(
+            flags(&m),
+            (false, false, false, false, false, false, false, true)
+        );
+
+        let rec_raw = RawUi {
+            components: vec![crate::Component {
+                name: "R",
+                params: vec![],
+                body: vec![use_node("R", vec![])],
+            }],
+            pages: vec![],
+        };
+        let m = use_mask(&rec_raw, &use_node("R", vec![]));
+        assert_eq!(
+            flags(&m),
+            (false, false, false, false, false, false, false, true)
+        );
+    }
+
+    #[test]
+    fn mask_nodes_aggregates_across_nodes() {
+        let raw = RawUi {
+            components: vec![],
+            pages: vec![],
+        };
+        let comps = HashMap::new();
+        let nodes = vec![
+            el(Some(Expr::Ref("hover")), vec![], vec![]),
+            Node::Slot,
+            el(Some(Expr::Binding("t")), vec![], vec![]),
+        ];
+        let m = mask_nodes(&nodes, &comps, &raw);
+        assert_eq!(m.bindings, vec!["t"]);
+        assert_eq!(
+            flags(&m),
+            (true, false, false, false, false, false, false, true)
+        );
+        assert!(!m.can_cache());
+
+        let empty = mask_nodes(&[], &comps, &raw);
+        assert!(empty.bindings.is_empty());
+        assert_eq!(
+            flags(&empty),
+            (false, false, false, false, false, false, false, false)
+        );
+    }
+
+    #[test]
+    fn val_to_cache_key_pins_exact_keys() {
+        let mut it = Interner::new();
+        assert_eq!(val_to_cache_key(Val::S("literal"), &mut it), "literal");
+        assert_eq!(it.len(), 0, "S 直接返回静态串，不进去重表");
+
+        assert_eq!(val_to_cache_key(Val::F(1.0), &mut it), "1");
+        assert_eq!(val_to_cache_key(Val::F(2.5), &mut it), "2.5");
+        assert_eq!(val_to_cache_key(Val::F(0.0), &mut it), "0");
+        assert_eq!(it.len(), 3);
+
+        assert_eq!(val_to_cache_key(Val::B(true), &mut it), "true");
+        assert_eq!(val_to_cache_key(Val::B(false), &mut it), "false");
+        assert_eq!(it.len(), 3, "B 返回静态串，不进去重表");
+
+        assert_eq!(
+            val_to_cache_key(Val::L(vec![Val::F(1.0), Val::S("a")]), &mut it),
+            "L([F(1.0), S(\"a\")])"
+        );
+        assert_eq!(
+            val_to_cache_key(Val::Rec(vec![("id", Val::S("a"))]), &mut it),
+            "Rec([(\"id\", S(\"a\"))])"
+        );
+        assert_eq!(
+            val_to_cache_key(Val::Raw(PropertyValue::StaticStr("x")), &mut it),
+            "Raw(\"x\")"
+        );
+        assert_eq!(it.len(), 6, "F/L/Rec/Raw 各插入一条");
+    }
+
+    fn build_root(classes: Vec<ClassTok>, children: Vec<Node>) -> Element {
+        let raw = RawUi {
+            components: vec![],
+            pages: vec![Page {
+                name: "p",
+                root: vec![Node::El(ElementNode {
+                    tag: NodeTag::Box,
+                    key: Some(Expr::LitS("root")),
+                    classes,
+                    attrs: vec![],
+                    children,
+                })],
+            }],
+        };
+        let ui = crate::Ui::new(raw).unwrap();
+        let mut it = Interner::new();
+        let mut els = ui.build("p", &EmptyHost, &mut it).unwrap();
+        els.remove(0)
+    }
+
+    #[test]
+    fn element_fingerprint_pins_shape() {
+        let e = build_root(
+            vec![ClassTok::Lit("hero"), ClassTok::Lit("accent")],
+            vec![Node::El(ElementNode {
+                tag: NodeTag::Text,
+                key: None,
+                classes: vec![],
+                attrs: vec![],
+                children: vec![],
+            })],
+        );
+        let fp = element_fingerprint(&e);
+        assert_eq!(fp.0, NodeTag::Box);
+        assert_eq!(fp.1, Some(ElementKey::Name("root")));
+        assert_eq!(fp.2, vec!["hero", "accent"]);
+        assert_eq!(fp.3, 1);
+
+        let plain = build_root(vec![], vec![]);
+        let fp = element_fingerprint(&plain);
+        assert_eq!(fp.0, NodeTag::Box);
+        assert_eq!(fp.1, Some(ElementKey::Name("root")));
+        assert!(fp.2.is_empty());
+        assert_eq!(fp.3, 0);
+    }
+}

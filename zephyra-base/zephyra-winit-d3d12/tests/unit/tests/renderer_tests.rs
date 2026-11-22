@@ -377,3 +377,374 @@ fn nv12_ps_dispatch_is_exact() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  脏区 / scissor / 混合助手的纯函数契约
+//
+//  下面这些函数不碰设备、不碰 GPU，但每一个都直接决定画面像素：
+//  `damage_scissor` 曾经配着错误的「clear 受 scissor 裁剪」假设，让每次交互帧
+//  把未脏区域清成底色（点一下界面就花掉）。所以这里全部用**字面量**钉住结果，
+//  绝不用「拿另一个函数再算一遍」的同义反复。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `Damage::Full` 必须给出整张目标的 scissor。
+#[test]
+fn damage_scissor_full_covers_entire_target() {
+    for size in [(1u32, 1u32), (640, 360), (1920, 1080)] {
+        let r = damage_scissor(size, zephyra_core::frame::Damage::Full);
+        assert_eq!(
+            (r.left, r.top, r.right, r.bottom),
+            (0, 0, size.0 as i32, size.1 as i32),
+            "size={size:?}：Full 的 scissor 必须覆盖整张目标"
+        );
+    }
+}
+
+/// 普通矩形：原点向下取整、结束点向上取整，保证脏区不被漏掉一像素。
+#[test]
+fn damage_scissor_rect_floors_origin_and_ceils_end() {
+    use zephyra_core::core::Rect;
+
+    let size = (200u32, 100u32);
+    // 小数边界：10.2 → 10，10.2+30.4=40.6 → 41；20.3 → 20，20.3+40.5=60.8 → 61。
+    let r = damage_scissor(
+        size,
+        zephyra_core::frame::Damage::Rect(Rect::new(10.2, 20.3, 30.4, 40.5)),
+    );
+    assert_eq!(
+        (r.left, r.top, r.right, r.bottom),
+        (10, 20, 41, 61),
+        "floor(原点) / ceil(终点) 写反会漏掉边缘像素"
+    );
+
+    // 整数矩形仍是逐像素精确的 1:1。
+    let r = damage_scissor(
+        size,
+        zephyra_core::frame::Damage::Rect(Rect::new(5.0, 6.0, 10.0, 11.0)),
+    );
+    assert_eq!((r.left, r.top, r.right, r.bottom), (5, 6, 15, 17));
+}
+
+/// 负坐标的原点必须被 `.max(0.0)` 夹到 0，而终点仍按真实坐标算。
+#[test]
+fn damage_scissor_rect_clamps_negative_origin_to_zero() {
+    use zephyra_core::core::Rect;
+
+    let size = (200u32, 100u32);
+    let r = damage_scissor(
+        size,
+        zephyra_core::frame::Damage::Rect(Rect::new(-12.0, -7.0, 20.0, 30.0)),
+    );
+    assert_eq!(
+        (r.left, r.top, r.right, r.bottom),
+        (0, 0, 8, 23),
+        "原点负坐标夹到 0，但 right/bottom 仍是 -12+20=8 / -7+30=23"
+    );
+
+    // 略小于 0 的小数：floor(-0.4) = -1，仍要夹到 0。
+    let r = damage_scissor(
+        size,
+        zephyra_core::frame::Damage::Rect(Rect::new(-0.4, -0.6, 5.2, 6.3)),
+    );
+    assert_eq!((r.left, r.top, r.right, r.bottom), (0, 0, 5, 6));
+}
+
+/// 退化矩形（零面积 / 宽高反号 / 完全在屏幕外）必须回退到全屏。
+///
+/// D3D12 的 scissor 是半开区间，`right <= left` 时什么都不画 —— 「脏区为空」
+/// 更可能是调用方算错，回退全屏才不会把整帧抹掉。
+#[test]
+fn damage_scissor_degenerate_rect_falls_back_to_full() {
+    use zephyra_core::core::Rect;
+
+    let size = (200u32, 100u32);
+    for rect in [
+        Rect::new(10.0, 10.0, 0.0, 0.0),     // 零面积
+        Rect::new(10.0, 10.0, 20.0, 0.0),    // 零高
+        Rect::new(10.0, 10.0, 0.0, 20.0),    // 零宽
+        Rect::new(20.0, 20.0, -5.0, -5.0),   // 宽高反号（交换）
+        Rect::new(-40.0, -40.0, 10.0, 10.0), // 完全在屏幕外（终点仍为负）
+    ] {
+        let r = damage_scissor(size, zephyra_core::frame::Damage::Rect(rect));
+        assert_eq!(
+            (r.left, r.top, r.right, r.bottom),
+            (0, 0, 200, 100),
+            "rect={rect:?} 是退化矩形，必须回退全屏"
+        );
+    }
+}
+
+/// 超大矩形按真实像素终点返回（不额外裁到目标尺寸）。
+#[test]
+fn damage_scissor_oversized_rect_keeps_pixel_endpoints() {
+    use zephyra_core::core::Rect;
+
+    let r = damage_scissor(
+        (100u32, 50u32),
+        zephyra_core::frame::Damage::Rect(Rect::new(10.0, 5.0, 1000.0, 500.0)),
+    );
+    assert_eq!((r.left, r.top, r.right, r.bottom), (10, 5, 1010, 505));
+}
+
+/// `Damage::Full` 的清屏区域是 `NULL`（两路都是 `None`）—— 这是「点击抹掉 UI」
+/// 那个 bug 的另一半：`ClearRenderTargetView` 根本不看 scissor。
+#[test]
+fn damage_clear_rects_full_returns_none_twice() {
+    let (scissor, rects) = damage_clear_rects((320u32, 240u32), zephyra_core::frame::Damage::Full);
+    assert!(scissor.is_none(), "Full 不该给出局部 scissor");
+    assert!(rects.is_none(), "Full 必须让 pRects == NULL，清整张目标");
+}
+
+/// 脏矩形的清屏矩形与 scissor 必须**逐字段相同**（同一块内存，不能各算一遍 drift）。
+#[test]
+fn damage_clear_rects_rect_returns_matching_rects() {
+    use zephyra_core::core::Rect;
+
+    let size = (320u32, 240u32);
+    let (scissor, rects) = damage_clear_rects(
+        size,
+        zephyra_core::frame::Damage::Rect(Rect::new(10.4, 20.6, 30.7, 40.2)),
+    );
+    let expected = RECT {
+        left: 10,
+        top: 20,
+        right: 42,  // ceil(10.4 + 30.7) = ceil(41.1)
+        bottom: 61, // ceil(20.6 + 40.2) = ceil(60.8)
+    };
+    let scissor = scissor.expect("Rect 必须有局部 scissor");
+    assert_eq!(
+        (scissor.left, scissor.top, scissor.right, scissor.bottom),
+        (expected.left, expected.top, expected.right, expected.bottom)
+    );
+    let rects = rects.expect("Rect 必须给出 pRects");
+    assert_eq!(rects.len(), 1, "脏区只有一块矩形");
+    assert_eq!(
+        (rects[0].left, rects[0].top, rects[0].right, rects[0].bottom),
+        (expected.left, expected.top, expected.right, expected.bottom),
+        "清屏矩形必须与 scissor 一致，否则会清一块、画另一块"
+    );
+
+    // 退化矩形回退到全屏后，两路仍要一致。
+    let (scissor, rects) = damage_clear_rects(
+        size,
+        zephyra_core::frame::Damage::Rect(Rect::new(5.0, 5.0, 0.0, 0.0)),
+    );
+    let scissor = scissor.unwrap();
+    assert_eq!(
+        (scissor.left, scissor.top, scissor.right, scissor.bottom),
+        (0, 0, 320, 240)
+    );
+    assert_eq!(rects.unwrap()[0].right, 320);
+}
+
+/// 颜色通道因子：10 个 `Coeff` 分支逐一钉死（穷尽匹配漏一项会编译失败，但
+/// **写错一项**只有测试能发现）。
+#[test]
+fn d3d12_factor_maps_every_coeff_to_its_color_blend() {
+    let cases: [(Coeff, D3D12_BLEND); 10] = [
+        (Coeff::Zero, D3D12_BLEND_ZERO),
+        (Coeff::One, D3D12_BLEND_ONE),
+        (Coeff::SrcColor, D3D12_BLEND_SRC_COLOR),
+        (Coeff::OneMinusSrcColor, D3D12_BLEND_INV_SRC_COLOR),
+        (Coeff::DstColor, D3D12_BLEND_DEST_COLOR),
+        (Coeff::OneMinusDstColor, D3D12_BLEND_INV_DEST_COLOR),
+        (Coeff::SrcAlpha, D3D12_BLEND_SRC_ALPHA),
+        (Coeff::OneMinusSrcAlpha, D3D12_BLEND_INV_SRC_ALPHA),
+        (Coeff::DstAlpha, D3D12_BLEND_DEST_ALPHA),
+        (Coeff::OneMinusDstAlpha, D3D12_BLEND_INV_DEST_ALPHA),
+    ];
+    for (coeff, expected) in cases {
+        assert_eq!(d3d12_factor(coeff), expected, "coeff={coeff:?}");
+    }
+}
+
+/// alpha 通道因子：颜色系数必须换成 alpha 对偶（`Sc→sa`、`1−Sc→1−sa`、
+/// `Cd→da`、`1−Cd→1−da`）—— 直接用颜色因子会让 PSO 创建回 `E_INVALIDARG`。
+#[test]
+fn d3d12_alpha_factor_maps_color_coeffs_to_alpha_duals() {
+    let cases: [(Coeff, D3D12_BLEND); 10] = [
+        (Coeff::Zero, D3D12_BLEND_ZERO),
+        (Coeff::One, D3D12_BLEND_ONE),
+        (Coeff::SrcColor, D3D12_BLEND_SRC_ALPHA),
+        (Coeff::OneMinusSrcColor, D3D12_BLEND_INV_SRC_ALPHA),
+        (Coeff::DstColor, D3D12_BLEND_DEST_ALPHA),
+        (Coeff::OneMinusDstColor, D3D12_BLEND_INV_DEST_ALPHA),
+        (Coeff::SrcAlpha, D3D12_BLEND_SRC_ALPHA),
+        (Coeff::OneMinusSrcAlpha, D3D12_BLEND_INV_SRC_ALPHA),
+        (Coeff::DstAlpha, D3D12_BLEND_DEST_ALPHA),
+        (Coeff::OneMinusDstAlpha, D3D12_BLEND_INV_DEST_ALPHA),
+    ];
+    for (coeff, expected) in cases {
+        assert_eq!(d3d12_alpha_factor(coeff), expected, "coeff={coeff:?}");
+    }
+}
+
+/// 混合模式按枚举声明顺序排成 29 项的表；边界与若干已知位置必须精确。
+#[test]
+fn mode_by_index_order_and_bounds() {
+    assert_eq!(mode_by_index(0), Some(BlendMode::Clear));
+    assert_eq!(mode_by_index(3), Some(BlendMode::SrcOver));
+    assert_eq!(mode_by_index(10), Some(BlendMode::DstATop));
+    assert_eq!(mode_by_index(14), Some(BlendMode::Screen));
+    assert_eq!(mode_by_index(15), Some(BlendMode::Overlay));
+    assert_eq!(mode_by_index(24), Some(BlendMode::Multiply));
+    assert_eq!(mode_by_index(28), Some(BlendMode::Luminosity));
+    // 29 项全部有效，第 29 项起越界。
+    for i in 0..29 {
+        assert!(mode_by_index(i).is_some(), "下标 {i} 应在表内");
+    }
+    assert_eq!(mode_by_index(29), None);
+    assert_eq!(mode_by_index(usize::MAX), None);
+}
+
+/// 不能用系数表达的模式（以及越界下标）必须返回 `None`，让调用方退回 `Src`。
+#[test]
+fn blend_desc_for_unsupported_modes_returns_none() {
+    for mode in [15usize, 20, 25, 28, 29, 100, usize::MAX] {
+        assert!(
+            blend_desc_for(mode).is_none(),
+            "mode={mode} 没有系数对，必须返回 None"
+        );
+    }
+}
+
+/// 可系数表达的模式返回完整的混合描述；逐字段用字面量钉住，防止颜色/alpha
+/// 两路因子串线，或写掩码被改坏。
+#[test]
+fn blend_desc_for_supported_modes_returns_desc_with_literal_factors() {
+    for mode in [0usize, 1, 3, 12, 14] {
+        assert!(blend_desc_for(mode).is_some(), "mode={mode} 应有系数对");
+    }
+
+    // SrcOver = (One, OneMinusSrcAlpha)，颜色与 alpha 两路一致。
+    let d = blend_desc_for(3).unwrap();
+    let rt = &d.RenderTarget[0];
+    assert_eq!(rt.BlendEnable.0, 1, "必须开启混合");
+    assert_eq!(rt.SrcBlend, D3D12_BLEND_ONE);
+    assert_eq!(rt.DestBlend, D3D12_BLEND_INV_SRC_ALPHA);
+    assert_eq!(rt.SrcBlendAlpha, D3D12_BLEND_ONE);
+    assert_eq!(rt.DestBlendAlpha, D3D12_BLEND_INV_SRC_ALPHA);
+    assert_eq!(rt.RenderTargetWriteMask, 15, "RGBA 四个通道都要写");
+    for rt in &d.RenderTarget {
+        assert_eq!(rt.SrcBlend, D3D12_BLEND_ONE);
+        assert_eq!(rt.DestBlend, D3D12_BLEND_INV_SRC_ALPHA);
+    }
+
+    // Clear = (Zero, Zero)。
+    let d = blend_desc_for(0).unwrap();
+    assert_eq!(d.RenderTarget[0].SrcBlend, D3D12_BLEND_ZERO);
+    assert_eq!(d.RenderTarget[0].DestBlend, D3D12_BLEND_ZERO);
+
+    // Screen = (One, OneMinusSrcColor)；alpha 路必须用它的对偶 INV_SRC_ALPHA。
+    let d = blend_desc_for(14).unwrap();
+    assert_eq!(d.RenderTarget[0].SrcBlend, D3D12_BLEND_ONE);
+    assert_eq!(d.RenderTarget[0].DestBlend, D3D12_BLEND_INV_SRC_COLOR);
+    assert_eq!(d.RenderTarget[0].DestBlendAlpha, D3D12_BLEND_INV_SRC_ALPHA);
+}
+
+/// 构造五条带 blend 的绘制命令；`command_blend_mode` 必须逐条认出同一个下标。
+fn draw_commands_with_blend(blend: BlendMode) -> Vec<zephyra_core::paint::Command> {
+    use zephyra_core::core::{Color, Point, Rect};
+    use zephyra_core::filter::FilterChain;
+    use zephyra_core::paint::{Command, RenderSource, TextureRef};
+
+    let rect = Rect::new(0.0, 0.0, 10.0, 10.0);
+    let radius = zephyra_core::core::CornerRadius { radius: 0.0 };
+    let shape = zephyra_core::core::CornerShape::ROUND;
+    let fill = Color::rgb(1.0, 1.0, 1.0);
+    let filter = FilterChain::default();
+    let texture = TextureRef("unit-test".into());
+    let vertices: std::sync::Arc<[zephyra_core::paint::Vertex]> = std::sync::Arc::from(vec![]);
+    let glyphs: std::sync::Arc<[zephyra_core::paint::GlyphQuad]> = std::sync::Arc::from(vec![]);
+
+    vec![
+        Command::Quad {
+            rect,
+            radius,
+            shape,
+            fill,
+            stroke: None,
+            filter: filter.clone(),
+            blend,
+            decorations: zephyra_core::decoration::Decorations::none(),
+        },
+        Command::Path {
+            vertices,
+            fill,
+            filter: filter.clone(),
+            blend,
+        },
+        Command::Image {
+            texture: texture.clone(),
+            src: None,
+            dst: rect,
+            radius,
+            shape,
+            tint: fill,
+            filter: filter.clone(),
+            blend,
+        },
+        Command::Text {
+            atlas: texture,
+            glyphs,
+            offset: Point::new(0.0, 0.0),
+            color: fill,
+            filter: filter.clone(),
+            blend,
+        },
+        Command::Custom {
+            bounds: rect,
+            source: RenderSource::new("unit-test", ()),
+            resource_key: None,
+            filter,
+            blend,
+        },
+    ]
+}
+
+/// 五种绘制命令都必须返回命令携带的 blend 下标（用一个非默认值防「恒返回
+/// SrcOver」的假实现）。
+#[test]
+fn command_blend_mode_reads_blend_from_every_draw_variant() {
+    use zephyra_core::paint::Command;
+
+    // DstATop 的下标是 10。
+    let cmd_blend = BlendMode::DstATop;
+    let commands = draw_commands_with_blend(cmd_blend);
+    assert_eq!(commands.len(), 5);
+    for cmd in &commands {
+        assert_eq!(
+            command_blend_mode(cmd),
+            Some(10),
+            "绘制命令 {cmd:?} 必须报告自己的 blend 下标"
+        );
+    }
+    // 再换一个下标，确认不是恒等式。
+    for cmd in &draw_commands_with_blend(BlendMode::Clear) {
+        assert_eq!(command_blend_mode(cmd), Some(0));
+    }
+    assert!(matches!(commands[0], Command::Quad { .. }));
+}
+
+/// 剪裁标记没有 blend —— 合成趟遇到它们不能误用上一条命令的模式。
+#[test]
+fn command_blend_mode_returns_none_for_clip_commands() {
+    use zephyra_core::core::Rect;
+    use zephyra_core::paint::Command;
+
+    assert_eq!(
+        command_blend_mode(&Command::PushClip(Rect::new(1.0, 2.0, 3.0, 4.0))),
+        None
+    );
+    assert_eq!(command_blend_mode(&Command::PopClip), None);
+}
+
+/// core::Rect → 扩展层 Rect 必须逐字段搬运（四个字段各自钉死）。
+#[test]
+fn core_rect_to_ext_preserves_all_four_fields() {
+    let ext = core_rect_to_ext(zephyra_core::core::Rect::new(-3.5, 7.25, 100.0, 40.75));
+    assert_eq!(ext.x, -3.5);
+    assert_eq!(ext.y, 7.25);
+    assert_eq!(ext.w, 100.0);
+    assert_eq!(ext.h, 40.75);
+}

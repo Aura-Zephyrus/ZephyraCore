@@ -33,3 +33,10 @@ copy_target = true
 
 # 保留默认 skip_calls（如 Vec::with_capacity 这类无业务语义的调用）。
 skip_calls_defaults = true
+
+# 等价变异裁决（见 zephyra-core/MUTATION_TESTING.md）：
+# 文档中只给出裁决规则，目前没有逐条确认并登记的等价变异，故这里只写格式说明。
+# cargo-mutants schema key = exclude_re（字符串数组；正则匹配 `cargo mutants --list`
+# 输出的名称）。确认某个存活变异确实无行为差异后，把它的名称正则写进该数组，
+# 并逐条写明等价理由；不允许用宽泛正则批量豁免、也不允许调高超时"刷绿"。
+# exclude_re = ["replace <exact mutant name from --list> with its anchored regex"]

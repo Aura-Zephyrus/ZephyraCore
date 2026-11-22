@@ -230,3 +230,125 @@ impl StyleSheet {
         Self::from_rules(self.rules)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zephyra_core::core::Color;
+    use zephyra_core::props;
+
+    const RED: Color = Color::rgb(1.0, 0.0, 0.0);
+    const BLUE: Color = Color::rgb(0.0, 0.0, 1.0);
+    const GREEN: Color = Color::rgb(0.0, 1.0, 0.0);
+
+    fn rule(selector: Selector, color: Color, order: u32) -> StyleRule {
+        StyleRule::new(
+            selector,
+            vec![Declaration {
+                key: &props::BACKGROUND,
+                value: PropertyValue::color(color),
+            }],
+            order,
+        )
+    }
+
+    fn bg_of(rule: &StyleRule) -> Option<Color> {
+        rule.declarations[0].value.get::<Color>()
+    }
+
+    #[test]
+    fn selector_matches_covers_every_branch() {
+        let tag = Selector::tag(NodeTag::Control);
+        assert!(tag.matches(NodeTag::Control, &["anything"]));
+        assert!(!tag.matches(NodeTag::Box, &[]), "类型不符直接失败");
+
+        let named = Selector::named("danger");
+        assert!(named.matches(NodeTag::Box, &["danger"]));
+        assert!(!named.matches(NodeTag::Box, &[]), "空节点不带分类名");
+        assert!(!named.matches(NodeTag::Box, &["safe"]));
+
+        let both = Selector {
+            tag: Some(NodeTag::Control),
+            names: vec!["danger", "compact"],
+        };
+        assert!(both.matches(NodeTag::Control, &["compact", "danger"]));
+        assert!(
+            !both.matches(NodeTag::Control, &["danger"]),
+            "少一个分类名就不算命中"
+        );
+        assert!(!both.matches(NodeTag::Box, &["danger", "compact"]));
+    }
+
+    #[test]
+    fn specificity_counts_only_names_and_empty_rule_is_detected() {
+        assert_eq!(Selector::tag(NodeTag::Control).specificity(), 0);
+        assert_eq!(Selector::named("a").specificity(), 1);
+        assert_eq!(
+            Selector {
+                tag: Some(NodeTag::Box),
+                names: vec!["a", "b", "c"],
+            }
+            .specificity(),
+            3
+        );
+
+        let empty = StyleRule::new(Selector::named("a"), Vec::new(), 0);
+        assert!(empty.is_empty());
+        assert!(!rule(Selector::named("a"), RED, 0).is_empty());
+    }
+
+    #[test]
+    fn from_rules_drops_empty_rules_and_sorts_by_specificity_then_order() {
+        assert!(StyleSheet::new().rules().is_empty());
+
+        let sheet = StyleSheet::from_rules(vec![
+            rule(Selector::named("a"), RED, 0),
+            StyleRule::new(Selector::named("b"), Vec::new(), 1), // 空规则要被剔除
+            rule(Selector::named("a"), BLUE, 2),
+            rule(Selector::tag(NodeTag::Control), GREEN, 3), // 特异性 0
+        ]);
+        assert_eq!(sheet.rules().len(), 3, "空规则不参与竞争");
+
+        let orders: Vec<u32> = sheet.rules().iter().map(|r| r.order).collect();
+        assert_eq!(orders, vec![3, 0, 2]);
+        let colors: Vec<Option<Color>> = sheet.rules().iter().map(bg_of).collect();
+        assert_eq!(
+            colors,
+            vec![Some(GREEN), Some(RED), Some(BLUE)],
+            "特异性低的排前面；同特异性按原始次序"
+        );
+    }
+
+    #[test]
+    fn merge_renumbers_other_rules_and_resorts() {
+        let a = StyleSheet::from_rules(vec![rule(Selector::named("x"), RED, 5)]);
+        let b = StyleSheet::from_rules(vec![
+            rule(Selector::named("x"), BLUE, 0),
+            StyleRule::new(
+                Selector {
+                    tag: Some(NodeTag::Control),
+                    names: vec!["x"],
+                },
+                vec![Declaration {
+                    key: &props::BACKGROUND,
+                    value: PropertyValue::color(GREEN),
+                }],
+                1,
+            ),
+        ]);
+
+        let merged = a.clone().merge(b);
+        assert_eq!(merged.rules().len(), 3);
+        let orders: Vec<u32> = merged.rules().iter().map(|r| r.order).collect();
+        assert_eq!(orders, vec![5, 6, 7], "other 的 order 要从 6 接着编");
+        let colors: Vec<Option<Color>> = merged.rules().iter().map(bg_of).collect();
+        assert_eq!(colors, vec![Some(RED), Some(BLUE), Some(GREEN)]);
+
+        // 空表合并：对方规则从 0 开始编号；空 other 不改变原表。
+        let from_empty = StyleSheet::new().merge(a.clone());
+        assert_eq!(from_empty.rules()[0].order, 0);
+        let unchanged = a.clone().merge(StyleSheet::new());
+        assert_eq!(unchanged.rules().len(), 1);
+        assert_eq!(unchanged.rules()[0].order, 5);
+    }
+}

@@ -304,3 +304,95 @@ impl<'a> Reader<'a> {
         Ok(Box::leak(s.to_string().into_boxed_str()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reader(bytes: &[u8]) -> Reader<'_> {
+        Reader { b: bytes, p: 0 }
+    }
+
+    #[test]
+    fn reader_expect_accepts_magic_and_rejects_mismatch() {
+        let mut r = reader(&[b'Z', b'Y', b'P', b'1', 0x7F]);
+        assert!(r.expect(MAGIC).is_ok());
+        assert_eq!(r.u8().unwrap(), 0x7F, "expect 应恰好消费 4 字节");
+
+        let err = reader(b"NOPE").expect(MAGIC).unwrap_err();
+        assert!(err.msg.contains("魔数"), "{err:?}");
+
+        let err = reader(b"ZY").expect(MAGIC).unwrap_err();
+        assert!(err.msg.contains("提前结束"), "{err:?}");
+    }
+
+    #[test]
+    fn reader_u8_reads_exact_bytes_and_advances() {
+        let mut r = reader(&[0x01, 0xFF, 0x00]);
+        assert_eq!(r.u8().unwrap(), 1);
+        assert_eq!(r.u8().unwrap(), 255);
+        assert_eq!(r.u8().unwrap(), 0);
+        let err = r.u8().unwrap_err();
+        assert!(err.msg.contains("提前结束"), "{err:?}");
+        assert!(reader(&[]).u8().is_err());
+    }
+
+    #[test]
+    fn reader_u32_is_little_endian() {
+        assert_eq!(
+            reader(&[0x78, 0x56, 0x34, 0x12]).u32().unwrap(),
+            0x1234_5678
+        );
+        assert_eq!(reader(&[0, 0, 0, 0]).u32().unwrap(), 0);
+        assert_eq!(reader(&[0xFF, 0xFF, 0xFF, 0xFF]).u32().unwrap(), u32::MAX);
+        let err = reader(&[1, 2, 3]).u32().unwrap_err();
+        assert!(err.msg.contains("提前结束"), "{err:?}");
+    }
+
+    #[test]
+    fn reader_items_bounds_against_remaining_bytes() {
+        let mut r = reader(&[0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(r.u8().unwrap(), 0);
+        assert_eq!(r.u8().unwrap(), 0);
+        assert_eq!(r.items(8).unwrap(), 8, "正好等于剩余字节数");
+        let err = r.items(9).unwrap_err();
+        assert!(err.msg.contains("超过剩余字节数"), "{err:?}");
+        assert_eq!(r.items(0).unwrap(), 0);
+
+        let fresh = reader(&[1, 2]);
+        assert_eq!(fresh.items(2).unwrap(), 2);
+        assert!(fresh.items(3).is_err());
+    }
+
+    #[test]
+    fn reader_bytes_reads_slice_and_rejects_overrun_and_overflow() {
+        let mut r = reader(&[1, 2, 3, 4]);
+        assert_eq!(r.bytes(3).unwrap(), &[1, 2, 3]);
+        assert_eq!(r.bytes(0).unwrap(), &[]);
+        let err = r.bytes(2).unwrap_err();
+        assert!(err.msg.contains("提前结束"), "{err:?}");
+
+        let empty: &'static [u8] = &[];
+        let mut overflow = Reader {
+            b: empty,
+            p: usize::MAX,
+        };
+        let err = overflow.bytes(1).unwrap_err();
+        assert!(err.msg.contains("长度溢出"), "{err:?}");
+    }
+
+    #[test]
+    fn reader_str_decodes_utf8_and_rejects_bad_input() {
+        let mut r = reader(&[3, 0, 0, 0, b'a', b'b', b'c', 0x7F]);
+        assert_eq!(r.str().unwrap(), "abc");
+        assert_eq!(r.u8().unwrap(), 0x7F, "str 应消费长度前缀 + 内容");
+
+        assert_eq!(reader(&[0, 0, 0, 0]).str().unwrap(), "");
+        assert_eq!(reader(&[2, 0, 0, 0, 0xC3, 0xA9]).str().unwrap(), "é");
+
+        let err = reader(&[1, 0, 0, 0, 0xFF]).str().unwrap_err();
+        assert!(err.msg.contains("UTF-8"), "{err:?}");
+        let err = reader(&[5, 0, 0, 0, b'a']).str().unwrap_err();
+        assert!(err.msg.contains("提前结束"), "{err:?}");
+    }
+}

@@ -1,0 +1,32 @@
+# cargo-mutants 配置：zephyra-camera（BASE 集，可选摄像头采集，默认零设备依赖）。
+# 运行（workspace root）：
+#   cargo mutants -p zephyra-camera --config .cargo/mutants/zephyra-camera.toml --in-place
+# `--in-place` 只能由命令行给出（见 cargo-mutants options.rs），故不写在这里。
+# 默认 feature 不含 capture/dx，不需要真实摄像头；不要为变异测试开启设备 feature。
+
+# 设备绑定 crate 的有意收窄：capture.rs / dx.rs / photo.rs 需要真实摄像头 /
+# DirectX 设备，headless 环境杀不死变异体；只变异纯 helper（像素格式、质量档位、
+# 恢复策略、设备描述、控制值——均有对应单元测试）。
+# 详见 zephyra-core/MUTATION_TESTING.md 的"平台 crate 作用域"。
+examine_globs = [
+  "zephyra-base/extra/zephyra-camera/src/pixels.rs",
+  "zephyra-base/extra/zephyra-camera/src/quality.rs",
+  "zephyra-base/extra/zephyra-camera/src/recovery.rs",
+  "zephyra-base/extra/zephyra-camera/src/device.rs",
+  "zephyra-base/extra/zephyra-camera/src/controls.rs",
+]
+
+test_package = ["zephyra-camera"]
+
+output = "mutants.out/zephyra-camera"
+
+timeout_multiplier = 4.0
+build_timeout_multiplier = 4.0
+
+copy_target = false
+skip_calls_defaults = true
+
+# 等价变异裁决：确认无行为差异后，把其 `--list` 名称的正则写入 exclude_re
+# （schema: 字符串数组，正则匹配 `cargo mutants --list` 输出的名称），逐条写明理由。
+# 不允许宽泛正则批量豁免；流程见 zephyra-core/MUTATION_TESTING.md。
+# exclude_re = ["replace <exact mutant name from --list> with its anchored regex"]

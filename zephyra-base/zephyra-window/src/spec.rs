@@ -149,3 +149,169 @@ impl WindowSpec {
         opts
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zephyra_app_config::WindowProfile;
+
+    #[test]
+    fn window_key_as_u64_returns_the_raw_value() {
+        assert_eq!(WindowKey(0).as_u64(), 0);
+        assert_eq!(WindowKey(1).as_u64(), 1);
+        assert_eq!(WindowKey(4_294_967_295).as_u64(), 4_294_967_295);
+        assert_eq!(WindowKey(u64::MAX).as_u64(), 18_446_744_073_709_551_615);
+    }
+
+    #[test]
+    fn window_key_unspecified_is_u64_max_and_never_auto_allocated() {
+        let key = WindowKey::unspecified();
+        assert_eq!(key.0, 18_446_744_073_709_551_615);
+        assert_eq!(key.as_u64(), 18_446_744_073_709_551_615);
+        assert_ne!(key, WindowKey(0));
+        assert_ne!(key, WindowKey(18_446_744_073_709_551_614));
+    }
+
+    #[test]
+    fn resolve_main_takes_every_field_from_the_window_section() {
+        let mut config = AppConfig::default();
+        config.window.title = Some("Main".into());
+        config.window.width = Some(1920);
+        config.window.height = Some(1080);
+        config.window.resizable = Some(false);
+        config.window.always_on_top = Some(true);
+        config.window.tool_window = Some(true);
+        config.window.transparent = true;
+        config.window.frameless = false;
+
+        let opts = WindowSpec::main().resolve(&config);
+
+        assert_eq!(opts.name, None);
+        assert_eq!(opts.title.as_deref(), Some("Main"));
+        assert_eq!(opts.size, Some((1920, 1080)));
+        assert_eq!(opts.resizable, Some(false));
+        assert_eq!(opts.always_on_top, Some(true));
+        assert_eq!(opts.tool_window, Some(true));
+        assert_eq!(opts.transparent, Some(true));
+        assert_eq!(opts.frameless, Some(false));
+    }
+
+    #[test]
+    fn resolve_named_layers_profile_over_window_section() {
+        let mut config = AppConfig::default();
+        config.window.title = Some("Main".into());
+        config.window.width = Some(800);
+        config.window.height = Some(600);
+        config.window.resizable = Some(true);
+        config.window.always_on_top = Some(false);
+        config.window.tool_window = Some(false);
+        config.windows.insert(
+            "panel".into(),
+            WindowProfile {
+                title: Some("Panel".into()),
+                width: Some(320),
+                height: Some(240),
+                frameless: Some(true),
+                transparent: Some(true),
+                resizable: Some(false),
+                always_on_top: Some(true),
+                tool_window: Some(true),
+            },
+        );
+
+        let opts = WindowSpec::named("panel").resolve(&config);
+
+        assert_eq!(opts.name.as_deref(), Some("panel"));
+        assert_eq!(opts.title.as_deref(), Some("Panel"));
+        assert_eq!(opts.size, Some((320, 240)));
+        assert_eq!(opts.frameless, Some(true));
+        assert_eq!(opts.transparent, Some(true));
+        assert_eq!(opts.resizable, Some(false));
+        assert_eq!(opts.always_on_top, Some(true));
+        assert_eq!(opts.tool_window, Some(true));
+    }
+
+    #[test]
+    fn resolve_spec_fields_override_profile_and_config() {
+        let mut config = AppConfig::default();
+        config.window.title = Some("Main".into());
+        config.window.width = Some(800);
+        config.window.height = Some(600);
+        config.window.resizable = Some(true);
+        config.windows.insert(
+            "panel".into(),
+            WindowProfile {
+                title: Some("Panel".into()),
+                width: Some(320),
+                height: Some(240),
+                frameless: Some(false),
+                transparent: Some(false),
+                resizable: Some(true),
+                ..WindowProfile::default()
+            },
+        );
+
+        let mut spec = WindowSpec::named("panel")
+            .title("Explicit")
+            .size(64, 48)
+            .resizable(false)
+            .tool_window()
+            .always_on_top();
+        spec.transparent = Some(true);
+        spec.frameless = Some(true);
+
+        let opts = spec.resolve(&config);
+
+        assert_eq!(opts.name.as_deref(), Some("panel"));
+        assert_eq!(opts.title.as_deref(), Some("Explicit"));
+        assert_eq!(opts.size, Some((64, 48)));
+        assert_eq!(opts.resizable, Some(false));
+        assert_eq!(opts.tool_window, Some(true));
+        assert_eq!(opts.always_on_top, Some(true));
+        assert_eq!(opts.transparent, Some(true));
+        assert_eq!(opts.frameless, Some(true));
+    }
+
+    #[test]
+    fn resolve_unknown_name_keeps_main_defaults_and_the_name() {
+        let mut config = AppConfig::default();
+        config.window.title = Some("Main".into());
+        config.window.width = Some(100);
+        config.window.height = Some(200);
+
+        let opts = WindowSpec::named("typo").resolve(&config);
+
+        assert_eq!(opts.name.as_deref(), Some("typo"));
+        assert_eq!(opts.title.as_deref(), Some("Main"));
+        assert_eq!(opts.size, Some((100, 200)));
+    }
+
+    #[test]
+    fn resolve_edge_values_are_not_clamped_or_dropped() {
+        let config = AppConfig::default();
+
+        let zero = WindowSpec::main().size(0, 0).title("").resolve(&config);
+        assert_eq!(zero.size, Some((0, 0)));
+        assert_eq!(zero.title.as_deref(), Some(""));
+
+        let max = WindowSpec::main().size(u32::MAX, u32::MAX).resolve(&config);
+        assert_eq!(max.size, Some((4_294_967_295, 4_294_967_295)));
+    }
+
+    #[test]
+    fn resolve_ignores_owner_because_it_is_a_runtime_relationship() {
+        let config = AppConfig::default();
+        let owner = WindowKey(7);
+        let spec = WindowSpec::main().owner(owner);
+
+        assert_eq!(spec.owner, Some(WindowKey(7)));
+        assert_eq!(spec.resolve(&config), WindowOpts::main(&config));
+    }
+
+    #[test]
+    fn resolve_default_spec_matches_main_window_options() {
+        let config = AppConfig::default();
+        let opts = WindowSpec::default().resolve(&config);
+        assert_eq!(opts, WindowOpts::main(&config));
+    }
+}

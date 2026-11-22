@@ -829,3 +829,139 @@ fn animation_attrs_reach_the_core_properties() {
         Some(false)
     );
 }
+
+// ============================== val (pure helpers) ==============================
+
+fn raw_val() -> Val {
+    Val::Raw(zephyra_core::property::PropertyValue::StaticStr("raw"))
+}
+
+#[test]
+fn val_field_finds_named_record_field_only() {
+    let rec = Val::Rec(vec![("id", Val::S("a")), ("n", Val::F(2.0))]);
+    assert_eq!(rec.field("id"), Some(&Val::S("a")));
+    assert_eq!(rec.field("n"), Some(&Val::F(2.0)));
+    assert_eq!(rec.field("missing"), None, "无此字段必须 None");
+
+    for v in [
+        Val::S("id"),
+        Val::F(1.0),
+        Val::B(true),
+        Val::L(vec![Val::S("id")]),
+        raw_val(),
+    ] {
+        assert_eq!(v.field("id"), None, "非记录不得取字段：{v:?}");
+    }
+}
+
+#[test]
+fn val_truthy_table_covers_every_variant() {
+    let cases = [
+        (Val::S(""), false),
+        (Val::S("x"), true),
+        (Val::F(0.0), false),
+        (Val::F(-0.0), false),
+        (Val::F(1.5), true),
+        (Val::F(-2.0), true),
+        (Val::B(false), false),
+        (Val::B(true), true),
+        (Val::L(vec![]), false),
+        (Val::L(vec![Val::B(false)]), true),
+        (Val::Rec(vec![]), true),
+        (Val::Rec(vec![("a", Val::F(0.0))]), true),
+        (raw_val(), false),
+    ];
+    for (v, want) in cases {
+        assert_eq!(v.truthy(), want, "truthy({v:?})");
+    }
+}
+
+#[test]
+fn val_as_str_only_returns_string_variant() {
+    let cases = [
+        (Val::S("hello"), Some("hello")),
+        (Val::S(""), Some("")),
+        (Val::F(1.0), None),
+        (Val::B(true), None),
+        (Val::L(vec![]), None),
+        (Val::Rec(vec![]), None),
+        (raw_val(), None),
+    ];
+    for (v, want) in cases {
+        assert_eq!(v.as_str(), want, "as_str({v:?})");
+    }
+}
+
+#[test]
+fn val_as_f32_only_returns_number_variant() {
+    let cases = [
+        (Val::F(2.5), Some(2.5)),
+        (Val::F(0.0), Some(0.0)),
+        (Val::F(-3.0), Some(-3.0)),
+        (Val::S("2.5"), None),
+        (Val::B(false), None),
+        (Val::L(vec![]), None),
+        (Val::Rec(vec![]), None),
+        (raw_val(), None),
+    ];
+    for (v, want) in cases {
+        assert_eq!(v.as_f32(), want, "as_f32({v:?})");
+    }
+}
+
+#[test]
+fn val_type_name_pins_all_six_variants() {
+    let cases = [
+        (Val::S("x"), "string"),
+        (Val::F(1.0), "number"),
+        (Val::B(true), "bool"),
+        (Val::L(vec![]), "list"),
+        (Val::Rec(vec![]), "record"),
+        (raw_val(), "raw"),
+    ];
+    for (v, want) in cases {
+        assert_eq!(v.type_name(), want, "type_name({v:?})");
+    }
+}
+
+// ============================== intern (pure helpers) ==============================
+
+#[test]
+fn interner_starts_empty_and_grows_on_distinct_strings() {
+    let mut it = Interner::new();
+    assert!(it.is_empty());
+    assert_eq!(it.len(), 0);
+
+    assert_eq!(it.intern("alpha"), "alpha");
+    assert_eq!(it.len(), 1);
+    assert!(!it.is_empty());
+    assert_eq!(it.intern("beta"), "beta");
+    assert_eq!(it.len(), 2);
+}
+
+#[test]
+fn interner_duplicate_reuses_same_static_allocation() {
+    let mut it = Interner::new();
+    let first = it.intern("dupe");
+    let second = it.intern("dupe");
+    assert_eq!(first, second);
+    assert_eq!(first.as_ptr(), second.as_ptr(), "重复串应复用同一份分配");
+    assert_eq!(it.len(), 1);
+
+    let third = it.intern(&format!("dyn-{}", 7));
+    assert_eq!(third, "dyn-7");
+    assert_eq!(it.len(), 2);
+    assert_eq!(it.intern("dyn-7"), third);
+    assert_eq!(it.intern("dupe").as_ptr(), first.as_ptr());
+    assert_eq!(it.len(), 2, "重复项不得增长去重表");
+}
+
+#[test]
+fn interner_handles_empty_string_once() {
+    let mut it = Interner::new();
+    let empty = it.intern("");
+    assert_eq!(empty, "");
+    assert_eq!(it.len(), 1);
+    assert_eq!(it.intern("").as_ptr(), empty.as_ptr());
+    assert_eq!(it.len(), 1);
+}

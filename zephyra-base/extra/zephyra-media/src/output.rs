@@ -255,4 +255,33 @@ mod tests {
         assert!(r.read_exact(&mut out2));
         assert_eq!(out2, [4, 5, 6, 7, 8, 9, 10]);
     }
+
+    #[test]
+    fn volume_bits_clamps_both_ends() {
+        // 上/下溢与无穷都被夹到 0/1 的位模式上。
+        assert_eq!(volume_bits(-1.0), volume_bits(0.0));
+        assert_eq!(volume_bits(f32::NEG_INFINITY), volume_bits(0.0));
+        assert_eq!(volume_bits(1.5), volume_bits(1.0));
+        assert_eq!(volume_bits(f32::INFINITY), volume_bits(1.0));
+        // 边界本身是精确的 IEEE 位模式。
+        assert_eq!(volume_bits(0.0), 0.0f32.to_bits());
+        assert_eq!(volume_bits(1.0), 1.0f32.to_bits());
+    }
+
+    #[test]
+    fn volume_bits_bits_volume_roundtrip_representative_values() {
+        for v in [0.0f32, 0.1, 0.25, 1.0 / 3.0, 0.5, 0.75, 0.9, 1.0] {
+            assert_eq!(bits_volume(volume_bits(v)), v, "v={v}");
+        }
+    }
+
+    #[test]
+    fn bits_volume_clamps_and_nan_survives_roundtrip() {
+        assert_eq!(bits_volume(0.5f32.to_bits()), 0.5);
+        assert_eq!(bits_volume((-2.0f32).to_bits()), 0.0);
+        assert_eq!(bits_volume(9.0f32.to_bits()), 1.0);
+        // clamp 对 NaN 返回 NaN（不 panic）。
+        assert!(bits_volume(f32::NAN.to_bits()).is_nan());
+        assert!(bits_volume(volume_bits(f32::NAN)).is_nan());
+    }
 }

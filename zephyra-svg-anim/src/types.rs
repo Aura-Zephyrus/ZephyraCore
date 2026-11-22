@@ -381,3 +381,102 @@ pub struct SvgFrame {
     /// 当前时间（毫秒）。
     pub time_ms: f32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timing_default_is_remove_and_unbounded() {
+        let t = Timing::default();
+        assert_eq!(t.begin, Begin::Offset(0.0));
+        assert_eq!(t.dur_ms, None);
+        assert_eq!(t.repeat, Repeat::Count(1));
+        assert_eq!(t.fill, FillMode::Remove);
+        assert!(!t.backwards);
+        assert_eq!(t.direction, Direction::Normal);
+        assert_eq!(t.calc_mode, CalcMode::Linear);
+        assert!(t.key_times.is_empty() && t.key_splines.is_empty());
+        assert_eq!(t.end_ms, None);
+        assert!(!t.additive_sum && !t.accumulate_sum);
+        assert_eq!(t.restart, Restart::Always);
+        assert_eq!(t.min_ms, 0.0);
+        assert_eq!(t.max_ms, None);
+        assert_eq!(t.access_key, None);
+    }
+
+    #[test]
+    fn animation_timing_returns_the_shared_timing_for_every_variant() {
+        let at = |min_ms: f32| Timing {
+            min_ms,
+            ..Timing::default()
+        };
+        let values = Values::List(vec![0.0, 1.0]);
+        let animations = vec![
+            Animation::Set(SetAnim {
+                timing: at(1.0),
+                attribute_name: "opacity".to_string(),
+                to: "0.5".to_string(),
+            }),
+            Animation::Opacity(OpacityAnim {
+                timing: at(2.0),
+                values: values.clone(),
+            }),
+            Animation::Fill(FillAnim {
+                timing: at(3.0),
+                values: Values::List(vec![[0.0; 4]]),
+            }),
+            Animation::Geometry(GeometryAnim {
+                timing: at(4.0),
+                attribute_name: "width".to_string(),
+                values: values.clone(),
+            }),
+            Animation::Style(StyleAnim {
+                timing: at(5.0),
+                attribute_name: "fill-opacity".to_string(),
+                values: values.clone(),
+            }),
+            Animation::StrokeColor(StrokeColorAnim {
+                timing: at(6.0),
+                values: Values::List(vec![[0.0; 4]]),
+            }),
+            Animation::Path(PathAnim {
+                timing: at(7.0),
+                values: Values::List(vec![Vec::new()]),
+            }),
+            Animation::Transform(TransformAnim {
+                timing: at(8.0),
+                kind: TransformKind::Translate,
+                values: Values::List(vec![[0.0; 3]]),
+            }),
+            Animation::Motion(MotionAnim {
+                timing: at(9.0),
+                path: Vec::new(),
+                rotate_mode: MotionRotate::None,
+                key_points: Vec::new(),
+                mpath_href: None,
+                origin: (0.0, 0.0),
+            }),
+        ];
+        for (i, anim) in animations.iter().enumerate() {
+            assert_eq!(anim.timing().min_ms, (i + 1) as f32);
+        }
+    }
+
+    #[test]
+    fn error_display_strings_are_stable() {
+        assert_eq!(SvgAnimError::NoSvgRoot.to_string(), "找不到 <svg> 根元素");
+        assert_eq!(SvgAnimError::NoViewBox.to_string(), "缺少 viewBox");
+        assert_eq!(
+            SvgAnimError::BadViewBox.to_string(),
+            "viewBox 必须是 4 个数"
+        );
+        assert_eq!(SvgAnimError::NoPath.to_string(), "没有可动画的 <path>");
+        assert_eq!(
+            SvgAnimError::MissingAttributeName.to_string(),
+            "<animate> 缺少 attributeName"
+        );
+        assert_eq!(SvgAnimError::BadTiming.to_string(), "时间属性非法");
+        assert_eq!(SvgAnimError::BadValues.to_string(), "values/from/to 非法");
+    }
+}

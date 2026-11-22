@@ -198,3 +198,7 @@ impl PinchState {
         self.moved = [false; 2];
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/input/pinch.rs"]
+mod tests;

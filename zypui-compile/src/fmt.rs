@@ -555,3 +555,186 @@ pub fn violations(src: &str) -> Vec<String> {
 pub fn is_formatted(src: &str) -> bool {
     violations(src).is_empty() && format(src).as_deref() == Some(src)
 }
+
+// ============================== 直接单测（归一化/属性段/注释/判据） ==============================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn describe_attrs(s: &str) -> Vec<String> {
+        split_attrs(s)
+            .into_iter()
+            .map(|a| format!("{}|{}", a.name, a.raw))
+            .collect()
+    }
+
+    #[test]
+    fn normalize_eol_pairs_crlf_and_converts_lone_cr() {
+        assert_eq!(normalize_eol(""), "");
+        assert_eq!(normalize_eol("abc"), "abc");
+        assert_eq!(normalize_eol("a\nb"), "a\nb");
+        assert_eq!(normalize_eol("a\r\nb"), "a\nb");
+        assert_eq!(normalize_eol("a\rb"), "a\nb");
+        assert_eq!(normalize_eol("a\r\nb\rc\n"), "a\nb\nc\n");
+        assert_eq!(normalize_eol("\r\n"), "\n");
+        // CRLF 必须成对吃掉，不能多出一个空行。
+        assert_eq!(normalize_eol("a\r\n\r\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn split_attrs_keeps_quoted_values_intact() {
+        assert_eq!(
+            describe_attrs(r#"a="1" b='two words' c="x > y""#),
+            vec![r#"a|a="1""#, r#"b|b='two words'"#, r#"c|c="x > y""#]
+        );
+        assert_eq!(
+            describe_attrs(r#"a='x=y' b="p q""#),
+            vec![r#"a|a='x=y'"#, r#"b|b="p q""#]
+        );
+        assert_eq!(
+            describe_attrs("  a=\"1\"   b=\"2\"  "),
+            vec![r#"a|a="1""#, r#"b|b="2""#]
+        );
+    }
+
+    #[test]
+    fn split_attrs_degrades_gracefully_on_malformed_input() {
+        assert!(split_attrs("").is_empty());
+        assert_eq!(describe_attrs("name"), vec!["name|name"]);
+        assert_eq!(describe_attrs("name=value"), vec!["name|name=value"]);
+        assert_eq!(
+            describe_attrs("a=\"1\" trailing"),
+            vec![r#"a|a="1""#, "trailing|trailing"]
+        );
+    }
+
+    #[test]
+    fn split_attrs_advances_past_every_attribute() {
+        // 回归：曾经解析完不推进游标导致死循环 + 1.6GB 分配失败。
+        let s = (0..20)
+            .map(|i| format!("k{i}=\"v{i}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let attrs = split_attrs(&s);
+        assert_eq!(attrs.len(), 20);
+        assert_eq!(attrs[0].name, "k0");
+        assert_eq!(attrs[19].name, "k19");
+        assert_eq!(attrs[19].raw, "k19=\"v19\"");
+    }
+
+    #[test]
+    fn reorder_attrs_moves_key_first_and_class_last() {
+        assert_eq!(reorder_attrs("<box>"), "<box>");
+        assert_eq!(reorder_attrs("</box>"), "</box>");
+        assert_eq!(reorder_attrs("key=\"a\""), "key=\"a\"");
+        assert_eq!(reorder_attrs("<box/>"), "<box/>");
+        assert_eq!(reorder_attrs("<box key=\"a\"/>"), "<box key=\"a\"/>");
+        assert_eq!(
+            reorder_attrs("<box class=\"c\" key=\"a\"/>"),
+            "<box key=\"a\" class=\"c\"/>"
+        );
+        assert_eq!(
+            reorder_attrs("<box key=\"a\" class=\"c\" icon=\"x\"/>"),
+            "<box key=\"a\" icon=\"x\" class=\"c\"/>"
+        );
+        assert_eq!(
+            reorder_attrs("<box key=\"a\" class=\"c\" icon=\"x\">"),
+            "<box key=\"a\" icon=\"x\" class=\"c\">"
+        );
+        assert_eq!(
+            reorder_attrs("<box class='c' key='a'/>"),
+            "<box key='a' class='c'/>"
+        );
+        // 引号内的 `>` / `=` / 空白一个字节都不碰。
+        assert_eq!(
+            reorder_attrs("<box icon=\"a > b\" class=\"c\" key=\"k\"/>"),
+            "<box key=\"k\" icon=\"a > b\" class=\"c\"/>"
+        );
+        assert_eq!(
+            reorder_attrs("<box key  = \"a\" class = \"c\"/>"),
+            "<box key  = \"a\" class = \"c\"/>"
+        );
+    }
+
+    #[test]
+    fn mask_comments_keeps_byte_count_and_newlines() {
+        assert_eq!(mask_comments("no comment"), "no comment");
+        assert_eq!(mask_comments("<!-- x -->"), "          ");
+        assert_eq!(mask_comments("<!--\n  <x>\n-->"), "    \n     \n   ");
+        // 多字节字符的每个字节都换成空格，仍是合法 UTF-8，打印宽度按字节对齐。
+        assert_eq!(mask_comments("a<!--中-->b"), "a          b");
+        assert_eq!(mask_comments("<!--x"), "     ");
+    }
+
+    #[test]
+    fn violations_empty_for_clean_lines_and_masked_comments() {
+        assert_eq!(violations(""), Vec::<String>::new());
+        assert_eq!(violations("<box key=\"a\"/>\n"), Vec::<String>::new());
+        assert_eq!(violations("    <box key=\"a\"/>"), Vec::<String>::new());
+        assert_eq!(
+            violations("<!-- <box class=\"x\" key=\"y\"/> -->\n<box key=\"a\" class=\"c\"/>\n"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn violations_pin_rule1_messages() {
+        assert_eq!(
+            violations("\t<box/>"),
+            vec!["1: 规则1 含 tab", "1: 规则1 缩进不是 2 的倍数（1）"]
+        );
+        assert_eq!(
+            violations("   <box key=\"a\"/>"),
+            vec!["1: 规则1 缩进不是 2 的倍数（3）"]
+        );
+        assert_eq!(
+            violations("<box/> \n"),
+            vec!["1: 规则1 行尾有空白：\"<box/> \""]
+        );
+    }
+
+    #[test]
+    fn violations_pin_rules_2_through_5() {
+        assert_eq!(
+            violations("hello"),
+            vec!["1: 规则2 非空行必须以 `<` 开头：\"hello\""]
+        );
+        assert_eq!(
+            violations("<box/><box/>"),
+            vec!["1: 规则3 一行多于一个开始标签：\"<box/><box/>\""]
+        );
+        assert_eq!(
+            violations("<box"),
+            vec!["1: 规则3 标签没有在行尾闭合（跨行？）：\"<box\""]
+        );
+        assert_eq!(
+            violations("</box"),
+            vec!["1: 规则3 闭标签行应以 `>` 结尾：\"</box\""]
+        );
+        assert_eq!(
+            violations("<box class=\"c\" key=\"a\"/>"),
+            vec![
+                "1: 规则4 key 不是第一个属性：<box class=\"c\" key=\"a\"/>",
+                "1: 规则5 class 不是最后一个属性：<box class=\"c\" key=\"a\"/>",
+            ]
+        );
+        assert_eq!(
+            violations("<box key=\"a\" class=\"c\" icon=\"x\"/>"),
+            vec!["1: 规则5 class 不是最后一个属性：<box key=\"a\" class=\"c\" icon=\"x\"/>"]
+        );
+        // 单引号属性同样要看得到（旧判据只认 `"` 会漏这一条）。
+        assert_eq!(
+            violations("<box key='a' class='c' icon='x'/>"),
+            vec!["1: 规则5 class 不是最后一个属性：<box key='a' class='c' icon='x'/>"]
+        );
+    }
+
+    #[test]
+    fn violations_use_source_line_numbers() {
+        assert_eq!(
+            violations("<box key=\"a\"/>\nhello\n"),
+            vec!["2: 规则2 非空行必须以 `<` 开头：\"hello\""]
+        );
+    }
+}

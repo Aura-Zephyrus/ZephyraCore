@@ -908,3 +908,230 @@ fn count_slots(nodes: &[Node]) -> usize {
 fn leak(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
 }
+
+// ============================== 直接单测（名字/插值/槽位/参数） ==============================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn describe_parts(parts: Vec<Part>) -> Vec<String> {
+        parts
+            .into_iter()
+            .map(|p| match p {
+                Part::Lit(s) => format!("L:{s}"),
+                Part::Expr(s, off) => format!("E:{s}@{off}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn is_pascal_accepts_uppercase_initial_and_rejects_the_rest() {
+        for (s, want) in [
+            ("A", true),
+            ("Abc", true),
+            ("A1", true),
+            ("A_B", true),
+            ("XML", true),
+            ("A_1", true),
+            ("", false),
+            ("a", false),
+            ("1A", false),
+            ("_A", false),
+            ("aB", false),
+            ("A-b", false),
+            ("A b", false),
+            ("中文", false),
+        ] {
+            assert_eq!(is_pascal(s), want, "is_pascal({s:?})");
+        }
+    }
+
+    #[test]
+    fn is_ident_accepts_letter_or_underscore_initial() {
+        for (s, want) in [
+            ("a", true),
+            ("_", true),
+            ("_a", true),
+            ("a1", true),
+            ("A_B9", true),
+            ("key", true),
+            ("", false),
+            ("1a", false),
+            ("a-b", false),
+            ("a b", false),
+            ("a.b", false),
+            ("中文", false),
+        ] {
+            assert_eq!(is_ident(s), want, "is_ident({s:?})");
+        }
+    }
+
+    #[test]
+    fn split_interp_cuts_literal_and_expression_parts() {
+        assert_eq!(
+            describe_parts(split_interp("", "t.zypui", 1, 1).unwrap()),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            describe_parts(split_interp("abc", "t.zypui", 1, 1).unwrap()),
+            vec!["L:abc"]
+        );
+        assert_eq!(
+            describe_parts(split_interp("{x}", "t.zypui", 1, 1).unwrap()),
+            vec!["E:x@2"]
+        );
+        assert_eq!(
+            describe_parts(split_interp("a{x}b{y}c", "t.zypui", 1, 1).unwrap()),
+            vec!["L:a", "E:x@3", "L:b", "E:y@7", "L:c"]
+        );
+        // 引号里的 `}` 不当分段符。
+        assert_eq!(
+            describe_parts(split_interp("{'}'}", "t.zypui", 1, 1).unwrap()),
+            vec![r#"E:'}'@2"#]
+        );
+        assert_eq!(
+            describe_parts(split_interp("{\"}\"}", "t.zypui", 1, 1).unwrap()),
+            vec![r#"E:"}"@2"#]
+        );
+        // UTF-8 按整字符前进，列偏移按字节计。
+        assert_eq!(
+            describe_parts(split_interp("中{x}", "t.zypui", 1, 1).unwrap()),
+            vec!["L:中", "E:x@5"]
+        );
+    }
+
+    #[test]
+    fn split_interp_unclosed_brace_pins_diagnostic() {
+        // Part 不实现 Debug/PartialEq，用 match 取出 Err 再比对。
+        match split_interp("a{x", "t.zypui", 2, 4) {
+            Err(d) => assert_eq!(d, Diag::error("t.zypui", 2, 4, "`{` 没有配对的 `}`")),
+            Ok(_) => panic!("未闭合的 `{{` 应当报错"),
+        }
+    }
+
+    #[test]
+    fn count_slots_walks_every_branch_but_not_use_children() {
+        assert_eq!(count_slots(&[]), 0);
+        assert_eq!(count_slots(&[Node::Slot]), 1);
+        let nested = vec![
+            Node::El(ElementNode {
+                tag: NodeTag::Box,
+                key: None,
+                classes: vec![],
+                attrs: vec![],
+                children: vec![Node::Slot],
+            }),
+            Node::If(IfNode {
+                cond: Expr::LitB(true),
+                then: vec![Node::Slot],
+                els: vec![Node::Slot],
+            }),
+            Node::For(ForNode {
+                var: "i",
+                index: None,
+                track_key: None,
+                list: Expr::Ref("xs"),
+                body: vec![Node::Slot],
+            }),
+            Node::Use(UseNode {
+                comp: "C",
+                key: None,
+                class_extra: vec![],
+                args: vec![],
+                children: vec![Node::Slot],
+            }),
+        ];
+        // El 内 1 + If 两支 2 + For 内 1 + Use 内 0 = 4。
+        assert_eq!(count_slots(&nested), 4);
+    }
+
+    #[test]
+    fn parse_params_splits_on_ascii_whitespace() {
+        let mut d = Vec::new();
+        assert_eq!(
+            parse_params("", "t.zypui", 1, 1, &mut d),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_params("a b c", "t.zypui", 1, 1, &mut d),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(
+            parse_params("  a\t b\n c  ", "t.zypui", 1, 1, &mut d),
+            vec!["a", "b", "c"]
+        );
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn parse_params_pins_reserved_and_builtin_diagnostics() {
+        let mut d = Vec::new();
+        let params = parse_params(
+            "1a a-b 中文 key hover class press focused",
+            "t.zypui",
+            2,
+            3,
+            &mut d,
+        );
+        assert_eq!(params, Vec::<String>::new());
+        // 保留字检查在内置词之前：全部命中「保留字」，不是「撞名」。
+        assert_eq!(
+            d,
+            vec![
+                Diag::error("t.zypui", 2, 3, "参数名 `1a` 不是合法标识符"),
+                Diag::error("t.zypui", 2, 3, "参数名 `a-b` 不是合法标识符"),
+                Diag::error("t.zypui", 2, 3, "参数名 `中文` 不是合法标识符"),
+                Diag::error(
+                    "t.zypui",
+                    2,
+                    3,
+                    "参数名 `key` 是保留字（key/class 是实例通道，hover/press 是内置词）"
+                ),
+                Diag::error(
+                    "t.zypui",
+                    2,
+                    3,
+                    "参数名 `hover` 是保留字（key/class 是实例通道，hover/press 是内置词）"
+                ),
+                Diag::error(
+                    "t.zypui",
+                    2,
+                    3,
+                    "参数名 `class` 是保留字（key/class 是实例通道，hover/press 是内置词）"
+                ),
+                Diag::error(
+                    "t.zypui",
+                    2,
+                    3,
+                    "参数名 `press` 是保留字（key/class 是实例通道，hover/press 是内置词）"
+                ),
+                Diag::error(
+                    "t.zypui",
+                    2,
+                    3,
+                    "参数名 `focused` 是保留字（key/class 是实例通道，hover/press 是内置词）"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_params_keeps_valid_names_and_reports_all_errors() {
+        let mut d = Vec::new();
+        let params = parse_params("ok 9bad key good", "t.zypui", 7, 5, &mut d);
+        assert_eq!(params, vec!["ok", "good"]);
+        assert_eq!(
+            d,
+            vec![
+                Diag::error("t.zypui", 7, 5, "参数名 `9bad` 不是合法标识符"),
+                Diag::error(
+                    "t.zypui",
+                    7,
+                    5,
+                    "参数名 `key` 是保留字（key/class 是实例通道，hover/press 是内置词）"
+                ),
+            ]
+        );
+    }
+}

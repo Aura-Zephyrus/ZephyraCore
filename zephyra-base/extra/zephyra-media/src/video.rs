@@ -278,8 +278,9 @@ pub fn from_video_frame(frame: VideoFrame) -> VideoFrameSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use zephyra_render_ext::prelude::FrameSource;
-    use zephyra_video::{Rect, Size};
+    use zephyra_video::{NativeResourceOwner, Rect, Size};
 
     fn frame(fmt: VideoPixelFormat, w: u32, h: u32, shift: usize) -> VideoFrame {
         let cw = w as usize / 2;
@@ -368,5 +369,262 @@ mod tests {
         assert_eq!(planes.plane(1).unwrap(), uv.as_slice());
         assert_eq!(planes.plane(0).unwrap().len(), w * h);
         assert_eq!(planes.plane(1).unwrap().len(), w * h / 2);
+    }
+
+    fn frame_from_planes(
+        fmt: VideoPixelFormat,
+        w: u32,
+        h: u32,
+        planes: Vec<Vec<u8>>,
+    ) -> VideoFrame {
+        VideoFrame::from_cpu(
+            fmt,
+            Size::new(w, h),
+            Rect::new(0, 0, w, h),
+            Size::new(w, h),
+            planes,
+            0,
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn nv21_swaps_u_and_v_values() {
+        // NV21 的交错面是 [V, U]；NV12 输出必须是 [U, V]。
+        let f = frame_from_planes(
+            VideoPixelFormat::NV21,
+            2,
+            2,
+            vec![vec![1, 2, 3, 4], vec![0x11, 0x22]],
+        );
+        let out = to_nv12(&f).unwrap();
+        assert_eq!(out.y_plane(), &[1, 2, 3, 4]);
+        assert_eq!(out.uv_plane(), &[0x22, 0x11]);
+        assert_eq!((out.width(), out.height()), (2, 2));
+    }
+
+    #[test]
+    fn p010le_10bit_sample_math() {
+        // 每个采样 2 字节 (lo, hi)；sample = (lo >> 2) | (hi << 6)。
+        // 索引 i = row * stride + col * 4，而 2x2 的 stride 也是 4，
+        // 因此 (row=0,col=1) 与 (row=1,col=0) 落在同一偏移 —— 钉住当前行为。
+        let mut y = vec![0u8; 16];
+        y[0..2].copy_from_slice(&[0x00, 0x00]); // i=0 → 0
+        y[4..6].copy_from_slice(&[0x04, 0x00]); // i=4 → 4 >> 2 = 1
+        y[8..10].copy_from_slice(&[0xff, 0x03]); // i=8 → 0x3f | (3 << 6) = 0xff
+
+        // UV: 两个 16-bit 采样（第二个放在偏移 4）。
+        let mut uv = vec![0u8; 8];
+        uv[0..2].copy_from_slice(&[0x08, 0x00]); // 8 >> 2 = 2
+        uv[4..6].copy_from_slice(&[0x10, 0x02]); // 4 | (2 << 6) = 0x84
+
+        let f = frame_from_planes(VideoPixelFormat::P010LE, 2, 2, vec![y, uv]);
+        let out = to_nv12(&f).unwrap();
+        assert_eq!(out.y_plane(), &[0, 1, 1, 0xff]);
+        assert_eq!(out.uv_plane(), &[2, 0x84]);
+    }
+
+    #[test]
+    fn odd_dimensions_use_div_ceil() {
+        // 3x3 → 色度 cw = ch = 2，Y 9 字节、UV 8 字节。
+        let f = frame_from_planes(
+            VideoPixelFormat::NV21,
+            3,
+            3,
+            vec![
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+                vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+            ],
+        );
+        let out = to_nv12(&f).unwrap();
+        assert_eq!((out.width(), out.height()), (3, 3));
+        assert_eq!(out.y_plane(), &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(
+            out.uv_plane(),
+            &[0x22, 0x11, 0x44, 0x33, 0x66, 0x55, 0x88, 0x77]
+        );
+    }
+
+    #[test]
+    fn nv12_non_tight_stride_uses_slow_path() {
+        // 奇数宽度下 NV12 的 UV 行距是 (w+1)，不满足紧排快速通道条件。
+        let f = frame_from_planes(
+            VideoPixelFormat::NV12,
+            3,
+            3,
+            vec![
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+                vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+            ],
+        );
+        assert_eq!(f.layout().planes()[0].stride, 3);
+        assert_eq!(f.layout().planes()[1].stride, 4);
+        let out = to_nv12(&f).unwrap();
+        assert_eq!(out.y_plane(), &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(
+            out.uv_plane(),
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+        );
+    }
+
+    #[test]
+    fn unsupported_format_returns_none() {
+        // YV12 有三平面且能构造出帧，但 to_nv12 不支持它。
+        let f = frame_from_planes(
+            VideoPixelFormat::YV12,
+            2,
+            2,
+            vec![vec![0; 4], vec![0; 1], vec![0; 1]],
+        );
+        assert!(to_nv12(&f).is_none());
+    }
+
+    #[test]
+    fn out_of_range_8bit_sample_defaults_to_128() {
+        // 4x2 的 I420：色度 cw=2，但实现按 col*2 索引，第二个色度样本越界。
+        let f = frame_from_planes(
+            VideoPixelFormat::I420,
+            4,
+            2,
+            vec![
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+                vec![0x44, 0x55],
+                vec![0x88, 0x99],
+            ],
+        );
+        let out = to_nv12(&f).unwrap();
+        assert_eq!(out.y_plane(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(out.uv_plane(), &[0x44, 0x88, 128, 128]);
+    }
+
+    #[test]
+    fn out_of_range_10bit_high_byte_defaults_to_zero() {
+        // 第二个色度样本只有 lo 字节存在，hi 越界 → 默认 0。
+        let mut y = vec![0u8; 16];
+        y[0..2].copy_from_slice(&[0x00, 0x00]); // 0
+        y[4..6].copy_from_slice(&[0x04, 0x00]); // 1
+        y[8..10].copy_from_slice(&[0x08, 0x00]); // 2
+        y[12..14].copy_from_slice(&[0x0c, 0x00]); // 3
+        let mut u = vec![0u8; 9];
+        u[0..2].copy_from_slice(&[0x10, 0x00]); // 4
+        u[8] = 0xff; // 0xff >> 2 = 0x3f（hi 默认 0）
+        let mut v = vec![0u8; 9];
+        v[0..2].copy_from_slice(&[0x20, 0x00]); // 8
+        v[8] = 0x00; // 0
+
+        let f = frame_from_planes(VideoPixelFormat::YUV420P10, 4, 2, vec![y, u, v]);
+        let out = to_nv12(&f).unwrap();
+        // 4x2 → 8 个 Y 采样；索引重复（0,4,8,12,8,12,16,20），
+        // 最后两个越界 → lo 默认 128、hi 默认 0 → (128 >> 2) = 32。
+        assert_eq!(out.y_plane(), &[0, 1, 2, 3, 2, 3, 32, 32]);
+        assert_eq!(out.uv_plane(), &[4, 8, 0x3f, 0]);
+    }
+
+    #[test]
+    fn zero_dimension_frames_cannot_be_constructed() {
+        // 上游构造器直接拒绝 0 宽/高，因此 to_nv12 里的 0 尺寸保护无法通过公开 API 触发。
+        let empty: Vec<Vec<u8>> = Vec::new();
+        assert!(VideoFrame::from_cpu(
+            VideoPixelFormat::I420,
+            Size::new(0, 8),
+            Rect::new(0, 0, 0, 8),
+            Size::new(0, 8),
+            empty.clone(),
+            0,
+            0,
+        )
+        .is_none());
+        assert!(VideoFrame::from_cpu(
+            VideoPixelFormat::I420,
+            Size::new(8, 0),
+            Rect::new(0, 0, 8, 0),
+            Size::new(8, 0),
+            empty,
+            0,
+            0,
+        )
+        .is_none());
+    }
+
+    fn native_frame_with_owner(
+        fmt: VideoPixelFormat,
+        w: u32,
+        h: u32,
+        handle: u64,
+        ts: i64,
+        dur: i64,
+    ) -> (VideoFrame, NativeResourceOwner) {
+        let owner = NativeResourceOwner::new(Arc::new(()));
+        let frame = VideoFrame::from_native_owned(
+            fmt,
+            Size::new(w, h),
+            Rect::new(0, 0, w, h),
+            Size::new(w, h),
+            vec![handle; fmt.num_planes()],
+            owner.clone(),
+            ts,
+            dur,
+        )
+        .unwrap();
+        (frame, owner)
+    }
+
+    #[test]
+    fn native_frames_map_format_and_propagate_metadata() {
+        for (fmt, expected) in [
+            (VideoPixelFormat::NV12, ExternalTextureFormat::Nv12),
+            (VideoPixelFormat::P010LE, ExternalTextureFormat::P010),
+            (VideoPixelFormat::I420, ExternalTextureFormat::Rgba8Unorm),
+        ] {
+            let (frame, owner) = native_frame_with_owner(fmt, 16, 8, 0x1234, 42, 7);
+            match from_video_frame(frame) {
+                VideoFrameSource::Native {
+                    handle,
+                    format,
+                    width,
+                    height,
+                    owner: got_owner,
+                    timestamp,
+                    duration,
+                } => {
+                    assert_eq!(handle, RawHandle(0x1234));
+                    assert_eq!(format, expected);
+                    assert_eq!((width, height), (16, 8));
+                    assert_eq!((timestamp, duration), (42, 7));
+                    assert_eq!(got_owner, owner);
+                }
+                VideoFrameSource::Cpu(_) => panic!("native frame must stay native"),
+            }
+        }
+    }
+
+    #[test]
+    fn native_frame_without_owner_stays_cpu() {
+        let frame = VideoFrame::from_native(
+            VideoPixelFormat::NV12,
+            Size::new(4, 4),
+            Rect::new(0, 0, 4, 4),
+            Size::new(4, 4),
+            vec![1, 2],
+            9,
+            3,
+        )
+        .unwrap();
+        assert!(matches!(from_video_frame(frame), VideoFrameSource::Cpu(_)));
+    }
+
+    #[test]
+    fn cpu_frame_stays_cpu() {
+        let frame = frame_from_planes(
+            VideoPixelFormat::I420,
+            2,
+            2,
+            vec![vec![0; 4], vec![0; 1], vec![0; 1]],
+        );
+        let src = from_video_frame(frame);
+        assert_eq!(src.timestamp(), 0);
+        assert_eq!(src.duration(), 0);
+        assert!(matches!(src, VideoFrameSource::Cpu(_)));
     }
 }

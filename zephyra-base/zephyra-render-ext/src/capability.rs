@@ -167,4 +167,64 @@ mod tests {
         }
         assert!(P.capabilities().has(Capability::CustomBasic));
     }
+
+    #[test]
+    fn capability_display_covers_every_variant() {
+        assert_eq!(Capability::CustomBasic.to_string(), "custom-basic");
+        assert_eq!(Capability::CustomOffscreen.to_string(), "custom-offscreen");
+        assert_eq!(
+            Capability::AttachmentSwitch.to_string(),
+            "attachment-switch"
+        );
+        assert_eq!(Capability::Readback.to_string(), "readback");
+        assert_eq!(Capability::DeviceRebuild.to_string(), "device-rebuild");
+        assert_eq!(Capability::Screenshot.to_string(), "screenshot");
+    }
+
+    #[test]
+    fn capabilities_with_toggles_every_flag() {
+        for cap in [
+            Capability::CustomBasic,
+            Capability::CustomOffscreen,
+            Capability::AttachmentSwitch,
+            Capability::Readback,
+            Capability::DeviceRebuild,
+            Capability::Screenshot,
+        ] {
+            let on = BackendCapabilities::none().with(cap, true);
+            assert!(on.has(cap), "with({cap:?}, true) must enable it");
+            let off = BackendCapabilities::all().with(cap, false);
+            assert!(!off.has(cap), "with({cap:?}, false) must disable it");
+        }
+    }
+
+    #[test]
+    fn capabilities_lists_reflect_each_flag() {
+        let all = BackendCapabilities::all();
+        assert_eq!(
+            all.enabled_list(),
+            vec![
+                "custom-basic",
+                "custom-offscreen",
+                "attachment-switch",
+                "readback",
+                "device-rebuild",
+                "screenshot",
+            ]
+        );
+        assert!(all.disabled_list().is_empty());
+        let none = BackendCapabilities::none();
+        assert!(none.enabled_list().is_empty());
+        assert_eq!(
+            none.disabled_list(),
+            vec![
+                "custom-basic",
+                "custom-offscreen",
+                "attachment-switch",
+                "readback",
+                "device-rebuild",
+                "screenshot",
+            ]
+        );
+    }
 }

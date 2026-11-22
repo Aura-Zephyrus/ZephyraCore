@@ -1,0 +1,28 @@
+# cargo-mutants 配置：zephyra-platform-win（BASE 集，Windows 平台能力实现）。
+# 运行（workspace root）：
+#   cargo mutants -p zephyra-platform-win --config .cargo/mutants/zephyra-platform-win.toml --in-place
+# `--in-place` 只能由命令行给出（见 cargo-mutants options.rs），故不写在这里。
+
+# 平台 crate 的有意收窄：只变异可在无真实 Windows 设备/注册表中运行的纯 helper。
+# DWM / 系统主题 / 真实注册表路径的测试依赖真机，无法在 headless CI 杀死变异体；
+# 见 zephyra-core/MUTATION_TESTING.md 的"平台 crate 作用域"说明。
+examine_globs = [
+  "zephyra-base/zephyra-platform-win/src/version.rs",
+  "zephyra-base/zephyra-platform-win/src/locale.rs",
+  "zephyra-base/zephyra-platform-win/src/live_resize.rs",
+]
+
+test_package = ["zephyra-platform-win"]
+
+output = "mutants.out/zephyra-platform-win"
+
+timeout_multiplier = 4.0
+build_timeout_multiplier = 4.0
+
+copy_target = false
+skip_calls_defaults = true
+
+# 等价变异裁决：确认无行为差异后，把其 `--list` 名称的正则写入 exclude_re
+# （schema: 字符串数组，正则匹配 `cargo mutants --list` 输出的名称），逐条写明理由。
+# 不允许宽泛正则批量豁免；流程见 zephyra-core/MUTATION_TESTING.md。
+# exclude_re = ["replace <exact mutant name from --list> with its anchored regex"]

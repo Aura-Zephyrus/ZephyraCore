@@ -94,3 +94,43 @@ fn msaa_target_builds_and_reports_sample_count() {
         .resolve_msaa(gpu.list())
         .expect("无 MSAA 时 resolve 应为空操作");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  `grown_capacity` 是纯计算（25% 余量 + ceil + 8 对齐），但决定「拖动窗口时
+//  重建几次链、显存占多少」。全部用字面量钉住，避免「拿公式再算一遍」的
+//  同义反复。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 零尺寸与极小尺寸：0 保持 0，非零一律至少对齐到 8。
+#[test]
+fn grown_capacity_zero_and_small_values() {
+    assert_eq!(
+        Swapchain::grown_capacity((0, 0), 0.25),
+        (0, 0),
+        "零尺寸不能被 headroom 变成非零"
+    );
+    assert_eq!(Swapchain::grown_capacity((1, 1), 0.25), (8, 8));
+    assert_eq!(Swapchain::grown_capacity((7, 9), 0.25), (16, 16));
+    // ceil(7*1.25)=9 → 16；ceil(9*1.25)=12 → 16。
+}
+
+/// 余量为 0 时只做 8 对齐：已经是倍数不变，否则向上取整到下一个倍数。
+#[test]
+fn grown_capacity_without_headroom_only_rounds_to_eight() {
+    assert_eq!(Swapchain::grown_capacity((8, 16), 0.0), (8, 16));
+    assert_eq!(Swapchain::grown_capacity((9, 17), 0.0), (16, 24));
+    assert_eq!(Swapchain::grown_capacity((1000, 1024), 0.0), (1000, 1024));
+}
+
+/// 25% 余量的具体数值：ceil 后再对齐到 8，结果随尺寸单调增长。
+#[test]
+fn grown_capacity_applies_quarter_headroom_then_eight_alignment() {
+    // 800*1.25=1000（恰好 8 的倍数）→ 1000；1000*1.25=1250 → 1256。
+    assert_eq!(Swapchain::grown_capacity((800, 1000), 0.25), (1000, 1256));
+    // 1920*1.25=2400 → 2400；1080*1.25=1350 → 1352。
+    assert_eq!(Swapchain::grown_capacity((1920, 1080), 0.25), (2400, 1352));
+    // 大尺寸同样按 ceil + 8 对齐，不溢出、不截断。
+    assert_eq!(Swapchain::grown_capacity((3840, 2160), 0.25), (4800, 2704));
+    // 长宽独立：一边正好是倍数、另一边不是。
+    assert_eq!(Swapchain::grown_capacity((640, 481), 0.25), (800, 608));
+}

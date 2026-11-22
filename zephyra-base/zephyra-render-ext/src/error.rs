@@ -132,4 +132,47 @@ mod tests {
             ImportError::Backend(_)
         ));
     }
+
+    /// Pin the exact payloads and cover the two branches the loose
+    /// `hresult_mapping` test never asserts: E_ACCESSDENIED and
+    /// STATUS_INVALID_HANDLE. Also pin OOM and the hex fallback message.
+    #[test]
+    fn hresult_mapping_pins_exact_messages() {
+        assert_eq!(
+            map_hresult_to_import_error(0x80070057u32 as i32),
+            ImportError::InvalidHandle("E_INVALIDARG".into())
+        );
+        assert_eq!(
+            map_hresult_to_import_error(0x80070005u32 as i32),
+            ImportError::InvalidHandle("E_ACCESSDENIED".into())
+        );
+        assert_eq!(
+            map_hresult_to_import_error(0x8007000Eu32 as i32),
+            ImportError::Backend("OOM".into())
+        );
+        assert_eq!(
+            map_hresult_to_import_error(0xC0000008u32 as i32),
+            ImportError::InvalidHandle("STATUS_INVALID_HANDLE".into())
+        );
+        assert_eq!(
+            map_hresult_to_import_error(0x887A0005u32 as i32),
+            ImportError::DeviceLost
+        );
+        assert_eq!(
+            map_hresult_to_import_error(0x887A0007u32 as i32),
+            ImportError::DeviceLost
+        );
+        assert_eq!(
+            map_hresult_to_import_error(0x887A0003u32 as i32),
+            ImportError::UnsupportedSource
+        );
+        assert_eq!(
+            map_hresult_to_import_error(0x12345678u32 as i32),
+            ImportError::Backend("HRESULT 0x12345678".into())
+        );
+        assert_eq!(
+            map_hresult_to_import_error(0),
+            ImportError::Backend("HRESULT 0x00000000".into())
+        );
+    }
 }

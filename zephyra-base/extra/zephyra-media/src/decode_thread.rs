@@ -353,3 +353,86 @@ fn aac_loop(
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::{channel, TryRecvError};
+
+    #[test]
+    fn take_reset_empty_channel() {
+        let (_tx, rx) = channel::<Command>();
+        assert!(!take_reset(&rx));
+    }
+
+    #[test]
+    fn take_reset_drains_non_reset_commands() {
+        let (tx, rx) = channel::<Command>();
+        tx.send(Command::Seek).unwrap();
+        tx.send(Command::Seek).unwrap();
+        assert!(!take_reset(&rx));
+        // 非 Reset 也被消费掉，不会堵在 channel 里。
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn take_reset_detects_reset_and_drains_everything() {
+        let (tx, rx) = channel::<Command>();
+        tx.send(Command::Seek).unwrap();
+        tx.send(Command::Reset).unwrap();
+        tx.send(Command::Seek).unwrap();
+        assert!(take_reset(&rx));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        // 连续多个 Reset 仍只报告一次 true。
+        let (tx, rx) = channel::<Command>();
+        tx.send(Command::Reset).unwrap();
+        tx.send(Command::Reset).unwrap();
+        assert!(take_reset(&rx));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn avcc_to_annexb_empty_and_start_code_passthrough() {
+        assert_eq!(avcc_to_annexb(&[]), Vec::<u8>::new());
+        // 已经是 Annex-B（3/4 字节起始码）时整段原样返回。
+        assert_eq!(
+            avcc_to_annexb(&[0, 0, 1, 0xaa, 0xbb]),
+            vec![0, 0, 1, 0xaa, 0xbb]
+        );
+        assert_eq!(
+            avcc_to_annexb(&[0, 0, 0, 1, 0xaa, 0xbb]),
+            vec![0, 0, 0, 1, 0xaa, 0xbb]
+        );
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn avcc_to_annexb_multiple_nals() {
+        let data = [
+            0, 0, 0, 3, 0xaa, 0xbb, 0xcc, // NAL #1 (长度 3)
+            0, 0, 0, 2, 0xdd, 0xee, // NAL #2 (长度 2)
+        ];
+        assert_eq!(
+            avcc_to_annexb(&data),
+            vec![0, 0, 0, 1, 0xaa, 0xbb, 0xcc, 0, 0, 0, 1, 0xdd, 0xee]
+        );
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn avcc_to_annexb_malformed_stops_at_bad_length() {
+        // len == 0 → 立即停止。
+        assert_eq!(avcc_to_annexb(&[0, 0, 0, 0, 0xaa]), Vec::<u8>::new());
+        // pos + len 越过末尾 → 立即停止。
+        assert_eq!(avcc_to_annexb(&[0, 0, 0, 5, 0xaa, 0xbb]), Vec::<u8>::new());
+        // 尾部不足 4 字节长度前缀 → 只输出此前完整的 NALU。
+        assert_eq!(
+            avcc_to_annexb(&[0, 0, 0, 3, 0xaa, 0xbb, 0xcc, 0, 0]),
+            vec![0, 0, 0, 1, 0xaa, 0xbb, 0xcc]
+        );
+        // 不足一个前缀的碎片 → 空输出。
+        assert_eq!(avcc_to_annexb(&[0, 0, 0]), Vec::<u8>::new());
+    }
+}

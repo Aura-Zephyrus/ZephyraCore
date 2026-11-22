@@ -114,3 +114,98 @@ pub mod dx12 {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hand a test a `&wgpu::Texture` without creating a device or a GPU.
+    ///
+    /// The extractors under test deliberately ignore their argument (their
+    /// parameters are named `_texture` and their bodies are constant `None`),
+    /// so the reference is never read. `MaybeUninit` is also never dropped as a
+    /// `Texture`, which keeps the stand-in completely inert.
+    fn with_synthetic_texture<R>(f: impl FnOnce(&wgpu::Texture) -> R) -> R {
+        let uninit = std::mem::MaybeUninit::<wgpu::Texture>::uninit();
+        // SAFETY: the only callers pass the reference to functions that never
+        // dereference it; the `MaybeUninit` storage is not read or dropped.
+        f(unsafe { &*uninit.as_ptr() })
+    }
+
+    #[test]
+    fn try_extract_source_never_invents_a_source() {
+        let result = with_synthetic_texture(try_extract_source);
+        assert!(result.is_none(), "自动导出默认必须拒绝（无共享标志）");
+    }
+
+    #[test]
+    fn try_extract_vulkan_image_raw_never_invents_a_handle() {
+        let result = with_synthetic_texture(try_extract_vulkan_image_raw);
+        assert!(result.is_none(), "单凭图像句柄不足以安全导入");
+    }
+
+    #[cfg(all(windows, feature = "native-dx12"))]
+    mod dx12_tests {
+        use super::with_synthetic_texture;
+        use crate::native::dx12::{
+            export_nt_handle_source, export_nt_handle_source_with_policy,
+            try_extract_nt_handle_source, NtHandleExportPolicy,
+        };
+        use windows::Win32::Graphics::Direct3D12::ID3D12Device;
+        use zephyra_render_ext::external_texture::ExternalTextureSource;
+
+        #[test]
+        fn nt_handle_export_policy_default_is_deny_by_default() {
+            let policy = NtHandleExportPolicy::default();
+            assert!(!policy.inherit_handle, "默认不允许子进程继承 NT 共享句柄");
+            assert!(
+                policy.security_descriptor.is_none(),
+                "默认不传 SECURITY_ATTRIBUTES（避免 null DACL）"
+            );
+        }
+
+        #[test]
+        fn nt_handle_export_policy_opt_in_keeps_exact_fields() {
+            let mut descriptor_storage = 0u32;
+            let descriptor = (&mut descriptor_storage as *mut u32).cast::<core::ffi::c_void>();
+            let policy = NtHandleExportPolicy {
+                inherit_handle: true,
+                security_descriptor: Some(descriptor),
+            };
+
+            assert!(policy.inherit_handle);
+            assert_eq!(policy.security_descriptor, Some(descriptor));
+
+            // The policy is `Copy`: passing it to the export entry point must
+            // not move it out of the caller.
+            let copied = policy;
+            assert_eq!(copied.security_descriptor, Some(descriptor));
+            assert!(copied.inherit_handle);
+
+            // The policy carries a raw pointer, so its `Send`/`Sync` impls are
+            // explicit in production code; keep that contract pinned here.
+            fn assert_send_sync<T: Send + Sync>() {}
+            assert_send_sync::<NtHandleExportPolicy>();
+        }
+
+        #[test]
+        fn try_extract_nt_handle_source_is_always_none() {
+            let result = with_synthetic_texture(try_extract_nt_handle_source);
+            assert!(result.is_none(), "旧入口无设备可用，必须返回 None");
+        }
+
+        #[test]
+        fn export_entry_points_have_expected_signatures() {
+            // Both unsafe entry points are callable only with a live D3D12
+            // device plus a shareable wgpu texture; assert their API surface
+            // here so a signature drift is caught without a real GPU.
+            let _plain: unsafe fn(&wgpu::Texture, &ID3D12Device) -> Option<ExternalTextureSource> =
+                export_nt_handle_source;
+            let _with_policy: unsafe fn(
+                &wgpu::Texture,
+                &ID3D12Device,
+                NtHandleExportPolicy,
+            ) -> Option<ExternalTextureSource> = export_nt_handle_source_with_policy;
+        }
+    }
+}

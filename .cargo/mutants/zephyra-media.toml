@@ -1,0 +1,33 @@
+# cargo-mutants 配置：zephyra-media（BASE 集，媒体播放桥接）。
+# 运行（workspace root）：
+#   cargo mutants -p zephyra-media --config .cargo/mutants/zephyra-media.toml --in-place
+# `--in-place` 只能由命令行给出（见 cargo-mutants options.rs），故不写在这里。
+
+# 设备绑定 crate 的有意收窄：audio_output.rs / audio_frames.rs / pipeline.rs /
+# video_stub.rs 依赖音频设备或真实解码器（audio_sink_leak.rs 的测试带 #[ignore]），
+# headless 环境杀不死变异体；只变异可独立断言的纯 helper（时钟、错误、解复用/解码
+# 帧记账、视频帧描述、输出同步）。详见 zephyra-core/MUTATION_TESTING.md
+# 的"平台 crate 作用域"。
+examine_globs = [
+  "zephyra-base/extra/zephyra-media/src/output.rs",
+  "zephyra-base/extra/zephyra-media/src/demux.rs",
+  "zephyra-base/extra/zephyra-media/src/decode_thread.rs",
+  "zephyra-base/extra/zephyra-media/src/video.rs",
+  "zephyra-base/extra/zephyra-media/src/clock.rs",
+  "zephyra-base/extra/zephyra-media/src/error.rs",
+]
+
+test_package = ["zephyra-media"]
+
+output = "mutants.out/zephyra-media"
+
+timeout_multiplier = 4.0
+build_timeout_multiplier = 4.0
+
+copy_target = false
+skip_calls_defaults = true
+
+# 等价变异裁决：确认无行为差异后，把其 `--list` 名称的正则写入 exclude_re
+# （schema: 字符串数组，正则匹配 `cargo mutants --list` 输出的名称），逐条写明理由。
+# 不允许宽泛正则批量豁免；流程见 zephyra-core/MUTATION_TESTING.md。
+# exclude_re = ["replace <exact mutant name from --list> with its anchored regex"]

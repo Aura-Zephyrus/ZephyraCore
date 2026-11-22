@@ -617,4 +617,31 @@ mod tests {
         let planes = CpuPlanes::rgba(bytes, 32);
         assert_eq!(planes.plane(0).unwrap().as_ptr(), ptr);
     }
+
+    /// `plane_count` is driven purely by `format`. Pin every enum variant so a
+    /// mutant that swaps Nv12/P010 or I420/I420P10, or changes the single-plane
+    /// fallback, is caught. No GPU or plane storage needed.
+    #[test]
+    fn cpu_planes_plane_count_table_drives_every_format() {
+        let cases: [(ExternalTextureFormat, usize); 10] = [
+            (ExternalTextureFormat::Rgba8UnormSrgb, 1),
+            (ExternalTextureFormat::Rgba8Unorm, 1),
+            (ExternalTextureFormat::Bgra8UnormSrgb, 1),
+            (ExternalTextureFormat::Bgra8Unorm, 1),
+            (ExternalTextureFormat::Rgba16Float, 1),
+            (ExternalTextureFormat::Rgba32Float, 1),
+            (ExternalTextureFormat::I420, 3),
+            (ExternalTextureFormat::Nv12, 2),
+            (ExternalTextureFormat::P010, 2),
+            (ExternalTextureFormat::I420P10, 3),
+        ];
+        for (fmt, expected) in cases {
+            let planes = CpuPlanes {
+                planes: [None, None, None],
+                format: fmt,
+                row_pitch: [0, 0, 0],
+            };
+            assert_eq!(planes.plane_count(), expected, "format {fmt:?}");
+        }
+    }
 }

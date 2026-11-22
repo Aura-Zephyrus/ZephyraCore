@@ -775,3 +775,502 @@ fn attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
     }
     None
 }
+
+// ========================================================================
+// 内联单元测试：SMIL 文本解析的纯函数分支（格式 / 缺属性 / 非法值）
+// ========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_path() -> Vec<Segment> {
+        vec![Segment::MoveTo(0.0, 0.0), Segment::LineTo(10.0, 10.0)]
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn attr_reads_double_single_and_unquoted_values() {
+        let a = r##" fill="#ff0000" fill-opacity='0.5' stroke=none x = 10 "##;
+        assert_eq!(attr(a, "fill"), Some("#ff0000"));
+        assert_eq!(attr(a, "fill-opacity"), Some("0.5"));
+        assert_eq!(attr(a, "stroke"), Some("none"));
+        assert_eq!(attr(a, "x"), Some("10"));
+        assert_eq!(attr(a, "dur"), None);
+    }
+
+    #[test]
+    fn attr_requires_exact_name() {
+        let a = "fill-opacity='0.5'";
+        assert_eq!(attr(a, "fill"), None);
+        assert_eq!(attr(a, "fill-opacity"), Some("0.5"));
+    }
+
+    #[test]
+    fn next_tag_respects_boundaries_and_quotes() {
+        let text = r#"<svg viewBox="0 0 1 1"><path d="M0 0L1 1" fill="a > b"/><animate attributeName="opacity" dur="1s"/></svg>"#;
+        let (attrs, after) = next_tag(text, "<path").unwrap();
+        assert!(attrs.contains("d=\"M0 0L1 1\""));
+        assert!(after.starts_with("<animate"));
+        assert!(next_tag(text, "<animate")
+            .unwrap()
+            .0
+            .contains("attributeName"));
+        assert!(next_tag(text, "<animateTransform").is_none());
+        assert!(next_tag(text, "<circle").is_none());
+        let (attrs, after) = next_tag("<path d='M0 0'/>", "<path").unwrap();
+        assert_eq!(attrs, " d='M0 0'/");
+        assert_eq!(after, "");
+    }
+
+    #[test]
+    fn parse_time_handles_units_and_clock_values() {
+        assert_eq!(parse_time("7878ms"), Some(7878.0));
+        assert_eq!(parse_time("1.5s"), Some(1500.0));
+        assert!(close(parse_time("0.001min").unwrap(), 60.0));
+        assert_eq!(parse_time("1h"), Some(3_600_000.0));
+        assert_eq!(parse_time("2"), Some(2000.0));
+        assert_eq!(parse_time("1:30"), Some(90_000.0));
+        assert_eq!(parse_time("1:02:03"), Some(3_723_000.0));
+        assert_eq!(parse_time(" 500ms "), Some(500.0));
+    }
+
+    #[test]
+    fn parse_time_rejects_invalid_values() {
+        assert_eq!(parse_time("abc"), None);
+        assert_eq!(parse_time("-5ms"), None);
+        assert_eq!(parse_time("NaNms"), None);
+        assert_eq!(parse_time("1:2:3:4"), None);
+        assert_eq!(parse_time("indefinite"), None);
+    }
+
+    #[test]
+    fn parse_begin_covers_offset_event_syncbase_wallclock_and_key() {
+        assert_eq!(parse_begin("indefinite"), Begin::Indefinite);
+        assert_eq!(parse_begin("0ms"), Begin::Offset(0.0));
+        assert_eq!(parse_begin("-500ms"), Begin::Offset(-500.0));
+        assert_eq!(parse_begin("+500ms"), Begin::Offset(500.0));
+        assert_eq!(
+            parse_begin("click"),
+            Begin::Event {
+                target: None,
+                event: "click".to_string()
+            }
+        );
+        assert_eq!(
+            parse_begin("other.end+500ms"),
+            Begin::Syncbase {
+                id: "other".to_string(),
+                event: "end".to_string(),
+                offset_ms: 500.0
+            }
+        );
+        assert_eq!(
+            parse_begin("other.begin-1s"),
+            Begin::Syncbase {
+                id: "other".to_string(),
+                event: "begin".to_string(),
+                offset_ms: -1000.0
+            }
+        );
+        assert_eq!(
+            parse_begin("wallclock(12:30:00)"),
+            Begin::Wallclock {
+                time_ms: 12.0 * 3_600_000.0 + 30.0 * 60_000.0
+            }
+        );
+        assert_eq!(
+            parse_begin("wallclock(500ms)"),
+            Begin::Wallclock { time_ms: 500.0 }
+        );
+        assert_eq!(parse_begin("accessKey(k)"), Begin::AccessKey('k'));
+        // 空串的 chars().all(..) 恒真 ⇒ 落成空事件名。
+        assert_eq!(
+            parse_begin(""),
+            Begin::Event {
+                target: None,
+                event: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_begin_malformed_syncbase_falls_back_to_offset() {
+        assert_eq!(parse_begin("other.123"), Begin::Offset(0.0));
+        // 裸数字按秒解释。
+        assert_eq!(parse_begin("123"), Begin::Offset(123_000.0));
+    }
+
+    #[test]
+    fn parse_f32_list_and_splines_filter_bad_tokens() {
+        assert_eq!(parse_f32_list("0;0.5;1"), vec![0.0, 0.5, 1.0]);
+        assert_eq!(parse_f32_list("1, 2 3"), vec![1.0, 2.0, 3.0]);
+        assert_eq!(parse_f32_list("1;abc;2"), vec![1.0, 2.0]);
+        let s = parse_splines("0 0 1 1;0.25 0.1 0.25 1");
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].control_points(), (0.0, 0.0, 1.0, 1.0));
+        assert!(parse_splines("0 0 1").is_empty());
+        assert!(parse_splines("2 0 1 1").is_empty());
+    }
+
+    #[test]
+    fn parse_f32_values_covers_values_from_to_by_and_to_only() {
+        assert_eq!(
+            parse_f32_values("values=\"0;0.5;1\"", 1.0),
+            Some(Values::List(vec![0.0, 0.5, 1.0]))
+        );
+        assert_eq!(
+            parse_f32_values("from=\"0\" to=\"1\"", 1.0),
+            Some(Values::FromTo(0.0, 1.0))
+        );
+        assert_eq!(parse_f32_values("by=\"0.5\"", 1.0), Some(Values::By(0.5)));
+        assert_eq!(
+            parse_f32_values("to=\"1\"", 1.0),
+            Some(Values::FromTo(1.0, 1.0))
+        );
+        assert_eq!(parse_f32_values("values=\"\"", 1.0), None);
+        assert_eq!(parse_f32_values("from=\"abc\" to=\"1\"", 1.0), None);
+        assert_eq!(parse_f32_values("", 1.0), None);
+    }
+
+    #[test]
+    fn parse_f32x3_values_expands_component_counts() {
+        assert_eq!(
+            parse_f32x3_values("values=\"45\"", &[0.0; 3]),
+            Some(Values::List(vec![[45.0, 0.0, 0.0]]))
+        );
+        assert_eq!(
+            parse_f32x3_values("values=\"10 20\"", &[0.0; 3]),
+            Some(Values::List(vec![[10.0, 20.0, 0.0]]))
+        );
+        assert_eq!(
+            parse_f32x3_values("values=\"1 2 3\"", &[0.0; 3]),
+            Some(Values::List(vec![[1.0, 2.0, 3.0]]))
+        );
+        assert_eq!(
+            parse_f32x3_values("from=\"0 0\" to=\"10 20\"", &[0.0; 3]),
+            Some(Values::FromTo([0.0, 0.0, 0.0], [10.0, 20.0, 0.0]))
+        );
+        assert_eq!(
+            parse_f32x3_values("by=\"5 6\"", &[0.0; 3]),
+            Some(Values::By([5.0, 6.0, 0.0]))
+        );
+        assert_eq!(
+            parse_f32x3_values("to=\"1 2 3\"", &[9.0, 9.0, 9.0]),
+            Some(Values::FromTo([9.0, 9.0, 9.0], [1.0, 2.0, 3.0]))
+        );
+        assert_eq!(parse_f32x3_values("", &[0.0; 3]), None);
+    }
+
+    #[test]
+    fn parse_color_values_named_hex_rgb_and_rgba() {
+        assert_eq!(
+            parse_color_values("values=\"red;transparent\""),
+            Some(Values::List(vec![
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0]
+            ]))
+        );
+        let hex = parse_color_values("values=\"#fff;#000000;#ff000080\"").unwrap();
+        match hex {
+            Values::List(v) => {
+                assert_eq!(v[0], [1.0, 1.0, 1.0, 1.0]);
+                assert_eq!(v[1], [0.0, 0.0, 0.0, 1.0]);
+                assert!(close(v[2][0], 1.0) && close(v[2][3], 128.0 / 255.0));
+            }
+            _ => panic!("values 应产出列表"),
+        }
+        let rgb = parse_color_values("values=\"rgb(255,0,0);rgba(0,0,255,0.5)\"").unwrap();
+        match rgb {
+            Values::List(v) => {
+                assert_eq!(v[0], [1.0, 0.0, 0.0, 1.0]);
+                assert_eq!(v[1], [0.0, 0.0, 1.0, 0.5]);
+            }
+            _ => panic!("values 应产出列表"),
+        }
+    }
+
+    #[test]
+    fn parse_color_values_from_to_and_invalid() {
+        assert_eq!(
+            parse_color_values("from=\"red\" to=\"blue\""),
+            Some(Values::FromTo([1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]))
+        );
+        assert_eq!(
+            parse_color_values("to=\"red\""),
+            Some(Values::FromTo([1.0, 1.0, 1.0, 1.0], [1.0, 0.0, 0.0, 1.0]))
+        );
+        assert_eq!(parse_color_values("values=\"not-a-color\""), None);
+        assert_eq!(parse_color_values("to=\"not-a-color\""), None);
+        assert_eq!(parse_color_values(""), None);
+    }
+
+    #[test]
+    fn parse_path_values_covers_values_from_to_and_to_only() {
+        let base = base_path();
+        let to = vec![Segment::MoveTo(2.0, 2.0), Segment::LineTo(3.0, 3.0)];
+        assert_eq!(
+            parse_path_values("values=\"M0 0L10 10;M2 2L3 3\"", &base),
+            Some(Values::List(vec![base.clone(), to.clone()]))
+        );
+        assert_eq!(
+            parse_path_values("from=\"M0 0L10 10\" to=\"M2 2L3 3\"", &base),
+            Some(Values::FromTo(base.clone(), to.clone()))
+        );
+        assert_eq!(
+            parse_path_values("to=\"M2 2L3 3\"", &base),
+            Some(Values::FromTo(base.clone(), to))
+        );
+        assert_eq!(parse_path_values("values=\"???\"", &base), None);
+        assert_eq!(parse_path_values("", &base), None);
+    }
+
+    #[test]
+    fn parse_timing_reads_full_attribute_set() {
+        let attrs = r#" begin="500ms" dur="1000ms" repeatCount="2" fill="freeze"
+            calcMode="spline" keyTimes="0;1" keySplines="0 0 1 1" end="2000ms"
+            additive="sum" accumulate="sum" restart="never" min="100ms" max="3000ms"
+            accessKey="k" direction="alternate" fill-mode="both""#;
+        let t = parse_timing(attrs).unwrap();
+        assert_eq!(t.begin, Begin::Offset(500.0));
+        assert_eq!(t.dur_ms, Some(1000.0));
+        assert_eq!(t.repeat, Repeat::Count(2));
+        assert_eq!(t.fill, FillMode::Freeze);
+        assert!(t.backwards);
+        assert_eq!(t.direction, Direction::Alternate);
+        assert_eq!(t.calc_mode, CalcMode::Spline);
+        assert_eq!(t.key_times, vec![0.0, 1.0]);
+        assert_eq!(t.key_splines.len(), 1);
+        assert_eq!(t.end_ms, Some(2000.0));
+        assert!(t.additive_sum && t.accumulate_sum);
+        assert_eq!(t.restart, Restart::Never);
+        assert_eq!(t.min_ms, 100.0);
+        assert_eq!(t.max_ms, Some(3000.0));
+        assert_eq!(t.access_key, Some('k'));
+    }
+
+    #[test]
+    fn parse_timing_rejects_missing_or_zero_duration() {
+        assert_eq!(parse_timing("begin=\"0ms\""), None);
+        assert_eq!(parse_timing("dur=\"0ms\""), None);
+        assert_eq!(parse_timing("dur=\"-1s\""), None);
+        assert_eq!(parse_timing("dur=\"indefinite\"").unwrap().dur_ms, None);
+    }
+
+    #[test]
+    fn parse_timing_repeat_combinations() {
+        assert_eq!(
+            parse_timing("dur=\"1s\" repeatCount=\"indefinite\"")
+                .unwrap()
+                .repeat,
+            Repeat::Indefinite
+        );
+        assert_eq!(
+            parse_timing("dur=\"1s\" repeatDur=\"indefinite\"")
+                .unwrap()
+                .repeat,
+            Repeat::Indefinite
+        );
+        assert_eq!(
+            parse_timing("dur=\"1s\" repeatCount=\"3\"").unwrap().repeat,
+            Repeat::Count(3)
+        );
+        assert_eq!(
+            parse_timing("dur=\"1s\" repeatDur=\"2500ms\"")
+                .unwrap()
+                .repeat,
+            Repeat::Duration(2500.0)
+        );
+        assert_eq!(
+            parse_timing("dur=\"1s\" repeatCount=\"5\" repeatDur=\"2500ms\"")
+                .unwrap()
+                .repeat,
+            Repeat::Bounded {
+                count: 5,
+                total_ms: 2500.0
+            }
+        );
+    }
+
+    #[test]
+    fn parse_timing_defaults_for_missing_optional_attributes() {
+        let t = parse_timing("dur=\"1s\"").unwrap();
+        assert_eq!(t.begin, Begin::Offset(0.0));
+        assert_eq!(t.repeat, Repeat::Count(1));
+        assert_eq!(t.fill, FillMode::Remove);
+        assert!(!t.backwards);
+        assert_eq!(t.direction, Direction::Normal);
+        assert_eq!(t.calc_mode, CalcMode::Linear);
+        assert!(t.key_times.is_empty() && t.key_splines.is_empty());
+        assert_eq!(t.end_ms, None);
+        assert!(!t.additive_sum && !t.accumulate_sum);
+        assert_eq!(t.restart, Restart::Always);
+        assert_eq!(t.min_ms, 0.0);
+        assert_eq!(t.max_ms, None);
+        assert_eq!(t.access_key, None);
+        assert_eq!(
+            parse_timing("dur=\"1s\" calcMode=\"discrete\"")
+                .unwrap()
+                .calc_mode,
+            CalcMode::Discrete
+        );
+        assert_eq!(
+            parse_timing("dur=\"1s\" calcMode=\"paced\"")
+                .unwrap()
+                .calc_mode,
+            CalcMode::Paced
+        );
+        assert_eq!(
+            parse_timing("dur=\"1s\" restart=\"whenNotActive\"")
+                .unwrap()
+                .restart,
+            Restart::WhenNotActive
+        );
+        assert!(
+            parse_timing("dur=\"1s\" fill-mode=\"backwards\"")
+                .unwrap()
+                .backwards
+        );
+    }
+
+    #[test]
+    fn parse_animation_builds_every_variant() {
+        let base = base_path();
+        let set = parse_animation(
+            "<set",
+            " attributeName=\"opacity\" to=\"0.5\" dur=\"1s\"",
+            &base,
+        );
+        assert!(matches!(set, Some(Animation::Set(_))));
+        assert!(matches!(
+            parse_animation(
+                "<animateColor",
+                " from=\"red\" to=\"blue\" dur=\"1s\"",
+                &base
+            ),
+            Some(Animation::Fill(_))
+        ));
+        let motion = parse_animation(
+            "<animateMotion",
+            r##" path="M0 0L10 0" dur="1s" rotate="auto-reverse" origin="5 7" keyPoints="0;1" mpath="#route""##,
+            &base,
+        );
+        match motion {
+            Some(Animation::Motion(m)) => {
+                assert_eq!(m.rotate_mode, MotionRotate::AutoReverse);
+                assert_eq!(m.origin, (5.0, 7.0));
+                assert_eq!(m.key_points, vec![0.0, 1.0]);
+                assert_eq!(m.mpath_href.as_deref(), Some("#route"));
+                assert_eq!(m.path.len(), 2);
+            }
+            _ => panic!("animateMotion 应产出 Motion"),
+        }
+        let transform = parse_animation(
+            "<animateTransform",
+            " type=\"translate\" from=\"0 0\" to=\"20 0\" dur=\"1s\"",
+            &base,
+        );
+        match transform {
+            Some(Animation::Transform(t)) => {
+                assert_eq!(t.kind, TransformKind::Translate);
+                assert_eq!(t.values, Values::FromTo([0.0, 0.0, 0.0], [20.0, 0.0, 0.0]));
+            }
+            _ => panic!("animateTransform 应产出 Transform"),
+        }
+        assert!(matches!(
+            parse_animation(
+                "<animate",
+                " attributeName=\"opacity\" values=\"0;1\" dur=\"1s\"",
+                &base
+            ),
+            Some(Animation::Opacity(_))
+        ));
+        assert!(matches!(
+            parse_animation(
+                "<animate",
+                " attributeName=\"fill\" values=\"red;blue\" dur=\"1s\"",
+                &base
+            ),
+            Some(Animation::Fill(_))
+        ));
+        assert!(matches!(
+            parse_animation(
+                "<animate",
+                " attributeName=\"d\" from=\"M0 0L1 1\" to=\"M2 2L3 3\" dur=\"1s\"",
+                &base
+            ),
+            Some(Animation::Path(_))
+        ));
+        assert!(matches!(
+            parse_animation(
+                "<animate",
+                " attributeName=\"stroke\" values=\"red;blue\" dur=\"1s\"",
+                &base
+            ),
+            Some(Animation::StrokeColor(_))
+        ));
+        assert!(matches!(
+            parse_animation(
+                "<animate",
+                " attributeName=\"fill-opacity\" values=\"0;1\" dur=\"1s\"",
+                &base
+            ),
+            Some(Animation::Style(_))
+        ));
+        assert!(matches!(
+            parse_animation(
+                "<animate",
+                " attributeName=\"width\" values=\"0;1\" dur=\"1s\"",
+                &base
+            ),
+            Some(Animation::Geometry(_))
+        ));
+    }
+
+    #[test]
+    fn parse_animation_rejects_unknown_and_incomplete_elements() {
+        let base = base_path();
+        assert_eq!(
+            parse_animation("<set", " attributeName=\"opacity\" dur=\"1s\"", &base),
+            None
+        );
+        assert_eq!(
+            parse_animation(
+                "<animateTransform",
+                " type=\"wobble\" from=\"0\" to=\"1\" dur=\"1s\"",
+                &base
+            ),
+            None
+        );
+        assert_eq!(
+            parse_animation(
+                "<animate",
+                " attributeName=\"mystery\" values=\"0;1\" dur=\"1s\"",
+                &base
+            ),
+            None
+        );
+        assert_eq!(
+            parse_animation("<animate", " values=\"0;1\" dur=\"1s\"", &base),
+            None
+        );
+        assert_eq!(
+            parse_animation("<animate", " attributeName=\"opacity\" dur=\"1s\"", &base),
+            None
+        );
+        assert_eq!(parse_animation("<unknown", " dur=\"1s\"", &base), None);
+    }
+
+    #[test]
+    fn parse_hex_rgba_accepts_three_six_eight_digits() {
+        assert_eq!(parse_hex_rgba("#fff"), Some([1.0, 1.0, 1.0, 1.0]));
+        assert_eq!(parse_hex_rgba("#000000"), Some([0.0, 0.0, 0.0, 1.0]));
+        let c = parse_hex_rgba("#ff000080").unwrap();
+        assert!(close(c[0], 1.0) && close(c[3], 128.0 / 255.0));
+        assert_eq!(parse_hex_rgba("fff"), None);
+        assert_eq!(parse_hex_rgba("#12345"), None);
+    }
+}
