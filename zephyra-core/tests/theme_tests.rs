@@ -101,9 +101,10 @@ const ALL_ROLES: &[(&str, Color, Color)] = &[
     (
         roles::SURFACE,
         Color::rgb(0.063, 0.071, 0.078),
-        // 权威定义在 theme.rs::light() 的 palette.neutral_0（#F2F2F7），
-        // 不是纯白；纯白会让卡片/层级结构令牌全部塌缩成同色。
-        Color::rgb(0.949, 0.949, 0.969),
+        // 权威定义在 theme.rs::light() 的 palette.neutral_0：颜色是线性空间，
+        // 宿主上屏编码到 sRGB，线性 0.888 ≈ sRGB #F2F2F7（Apple 分组背景）。
+        // 纯白或 0.949（上屏 #FCFCFD）都会让白 alpha 卡片与背景几乎同色。
+        Color::rgb(0.888, 0.888, 0.930),
     ),
     (
         roles::SURFACE_ALT,

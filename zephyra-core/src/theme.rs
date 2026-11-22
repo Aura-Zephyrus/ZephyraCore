@@ -263,7 +263,9 @@ impl Theme {
             // 于是那套「白 alpha 叠底」的结构令牌（card / layer / control_secondary…
             // ）合成出来正好等于 surface —— 卡片、圆角边框、hover 全部消失。
             // 用 Apple systemGroupedBackground #F2F2F7 同样能恢复层级。
-            neutral_0: Color::rgb(0.949, 0.949, 0.969),
+            // 颜色在线性空间，宿主上屏时编码到 sRGB：线性 0.888 ≈ sRGB #F2F2F7。
+            // 早先填 0.949 上屏仍是 #FCFCFD，白 alpha 卡片依旧和背景同色。
+            neutral_0: Color::rgb(0.888, 0.888, 0.930),
             neutral_100: Color::rgb(0.973, 0.976, 0.980),
             // Apple systemGray5 / systemGray4：hover 与 pressed 要有明显的两级差。
             neutral_200: Color::rgb(0.898, 0.898, 0.918),
